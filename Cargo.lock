@@ -311,6 +311,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "copper-morph"
+version = "0.1.0"
+dependencies = [
+ "copper-board",
+ "copper-drc",
+ "copper-dsn",
+ "copper-geometry",
+ "testkit",
+]
+
+[[package]]
 name = "copper-router"
 version = "0.1.0"
 dependencies = [
