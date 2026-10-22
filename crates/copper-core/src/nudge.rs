@@ -68,13 +68,14 @@ impl RouterBackend for NudgeBackend {
         trial_settings.max_passes = Some(TRIAL_PASSES);
 
         let mut open = unconnected_count(board);
+        let mut violations = violation_count(board);
         for round in 0..ROUNDS {
             let mut improved = false;
             for component in stuck_components(board).into_iter().take(PARTS_PER_ROUND) {
                 if halted(stop) || open == 0 {
                     break;
                 }
-                let mut best: Option<(usize, Board, IntVector)> = None;
+                let mut best: Option<(usize, Board, IntVector, usize)> = None;
                 for (dx, dy) in DIRECTIONS {
                     for distance in DISTANCES_MM {
                         if halted(stop) {
@@ -85,10 +86,16 @@ impl RouterBackend for NudgeBackend {
                             (dy * distance * per_mm).round() as i32,
                         );
                         let mut trial = board.clone();
-                        let moves = oracle.push(&mut trial, component, &want, PUSH_DEPTH);
-                        let Some(&(_, step)) = moves.iter().rev().find(|(c, _)| *c == component)
-                        else {
-                            continue;
+                        let step = if oracle.translate_shoving(&mut trial, &[component], &want) {
+                            want
+                        } else {
+                            let moves = oracle.push(&mut trial, component, &want, PUSH_DEPTH);
+                            let Some(&(_, step)) =
+                                moves.iter().rev().find(|(c, _)| *c == component)
+                            else {
+                                continue;
+                            };
+                            step
                         };
                         let moved_mm = f64::from(step.x).hypot(f64::from(step.y))
                             / per_mm.max(f64::MIN_POSITIVE);
@@ -108,12 +115,15 @@ impl RouterBackend for NudgeBackend {
                             continue;
                         }
                         let after = unconnected_count(&mut trial);
-                        if after < best.as_ref().map_or(open, |(count, _, _)| *count) {
-                            best = Some((after, trial, step));
+                        if after < best.as_ref().map_or(open, |(count, _, _, _)| *count) {
+                            let trial_violations = violation_count(&mut trial);
+                            if trial_violations <= violations {
+                                best = Some((after, trial, step, trial_violations));
+                            }
                         }
                     }
                 }
-                if let Some((count, trial, step)) = best {
+                if let Some((count, trial, step, trial_violations)) = best {
                     tracing::info!(
                         "nudge round {round}: component {component} by ({}, {}) closes {} connection(s)",
                         step.x,
@@ -122,6 +132,7 @@ impl RouterBackend for NudgeBackend {
                     );
                     *board = trial;
                     open = count;
+                    violations = trial_violations;
                     improved = true;
                 }
             }
@@ -151,6 +162,12 @@ fn halted(stop: &RouterStop) -> bool {
     stop.poll_cancel();
     stop.poll_deadline();
     stop.is_stop_requested()
+}
+
+fn violation_count(board: &mut Board) -> usize {
+    copper_drc::DesignRulesChecker::new(board)
+        .get_all_violations()
+        .len()
 }
 
 fn unconnected_count(board: &mut Board) -> usize {

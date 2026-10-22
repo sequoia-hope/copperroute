@@ -224,7 +224,31 @@ impl MoveOracle {
                 return false;
             }
         }
+        if self.routable_copper_is_soft {
+            self.rip_overrun_copper(board, components);
+        }
         true
+    }
+
+    /// The settle engine's blocker reroute, left to the router: routable copper of other nets that
+    /// the moved parts now crowd is ripped whole, so it is re-planned rather than left in violation.
+    fn rip_overrun_copper(&self, board: &mut Board, components: &[i32]) {
+        let hard = MoveOracle {
+            routable_copper_is_soft: false,
+            ..*self
+        };
+        let overrun: Vec<ItemId> = hard
+            .shortfalls(board, components, &IntVector::ZERO)
+            .into_keys()
+            .map(|(_, obstacle)| obstacle)
+            .filter(|id| board.get_item(*id).is_some_and(Item::is_routable))
+            .collect();
+        let mut ripped = BTreeSet::new();
+        for id in overrun {
+            ripped.extend(board.connection_items(id, StopConnectionOption::None));
+        }
+        ripped.retain(|id| board.get_item(*id).is_some_and(Item::is_routable));
+        board.remove_items(ripped);
     }
 
     /// Moves the component as far toward `by` as admissible, first pushing aside other free
