@@ -85,34 +85,6 @@ fn standing_still_is_always_admissible() {
 }
 
 #[test]
-#[ignore = "diagnostic: prints line-search fractions per fixture"]
-fn print_fractions() {
-    for name in [
-        "Issue313-FastTest.dsn",
-        "Issue756-tomu-fpga.dsn",
-        "Issue143-rpi_splitter.dsn",
-        "Issue508-DAC2020_bm05.dsn",
-    ] {
-        let mut board = read_board(name);
-        let oracle = oracle();
-        let span = board.bounding_box.ur.x - board.bounding_box.ll.x;
-        let ids = movable_components(&board);
-        let mut fractions = Vec::new();
-        for &id in ids.iter().take(15) {
-            let base = oracle.conflicts(&mut board, id, &IntVector::ZERO).len();
-            let (f, b) = oracle.line_search(&mut board, id, &IntVector::new(span / 50, 0));
-            fractions.push(format!("{f:.2}/{base}/{}", b.len()));
-        }
-        println!(
-            "{name}: {} movable of {}; fraction/base/blockers: {}",
-            ids.len(),
-            board.components.count(),
-            fractions.join(" ")
-        );
-    }
-}
-
-#[test]
 fn the_drc_checker_agrees_no_violation_was_added() {
     let mut board = read_board("Issue756-tomu-fpga.dsn");
     let oracle = oracle();
@@ -281,81 +253,6 @@ fn pushing_moves_further_than_a_plain_line_search_and_adds_no_violation() {
         gained > 0,
         "no push ever got further than the plain line search"
     );
-}
-
-#[test]
-#[ignore = "diagnostic: who blocks whom"]
-fn print_blockers() {
-    let mut board = read_board("Issue508-DAC2020_bm05.dsn");
-    let oracle = oracle();
-    let span = board.bounding_box.ur.x - board.bounding_box.ll.x;
-    let want = IntVector::new(span / 8, 0);
-    for id in movable_components(&board).into_iter().take(20) {
-        let (plain, blockers) = oracle.line_search(&mut board.clone(), id, &want);
-        let kinds: Vec<String> = blockers
-            .iter()
-            .map(|(_, o)| {
-                let item = board.get_item(*o).unwrap();
-                let c = item.component_id();
-                let kind = format!("{item:?}").split('(').next().unwrap().to_string();
-                let movable = oracle.line_search(&mut board.clone(), c.max(1), &want).0;
-                format!("{kind}@c{c}(fr{movable:.2})")
-            })
-            .collect();
-        let mut trial = board.clone();
-        let moves = oracle.push(&mut trial, id, &want, 2);
-        println!("c{id}: plain {plain:.2}; blockers {kinds:?}; push moves {moves:?}");
-    }
-}
-
-#[test]
-#[ignore = "diagnostic: step through one push"]
-fn print_one_push() {
-    let mut board = read_board("Issue508-DAC2020_bm05.dsn");
-    let oracle = oracle();
-    let span = board.bounding_box.ur.x - board.bounding_box.ll.x;
-    let want = IntVector::new(span / 8, 0);
-    let (f, b) = oracle.line_search(&mut board, 4, &want);
-    let describe =
-        |board: &Board,
-         b: &std::collections::BTreeSet<(copper_board::ItemId, copper_board::ItemId)>|
-         -> Vec<String> {
-            b.iter()
-                .map(|(m, o)| {
-                    let mi = board.get_item(*m).unwrap();
-                    let oi = board.get_item(*o).unwrap();
-                    format!(
-                        "{}c{} vs {}c{}",
-                        format!("{mi:?}").split('(').next().unwrap(),
-                        mi.component_id(),
-                        format!("{oi:?}").split('(').next().unwrap(),
-                        oi.component_id()
-                    )
-                })
-                .collect()
-        };
-    println!(
-        "before: fraction {f:.3} blockers {:?}",
-        describe(&board, &b)
-    );
-    let loc = |board: &Board, c: i32| {
-        board
-            .components
-            .get_all()
-            .find(|x| x.id == c)
-            .unwrap()
-            .get_location()
-            .cloned()
-    };
-    println!("c26 at {:?}", loc(&board, 26));
-    let (f26, _) = oracle.line_search(&mut board, 26, &want);
-    println!(
-        "c26 line search {f26:.3}; translate ok {}",
-        oracle.translate(&mut board, 26, &scale(&want, f26))
-    );
-    println!("c26 now at {:?}", loc(&board, 26));
-    let (f, b) = oracle.line_search(&mut board, 4, &want);
-    println!("after: fraction {f:.3} blockers {:?}", describe(&board, &b));
 }
 
 #[test]

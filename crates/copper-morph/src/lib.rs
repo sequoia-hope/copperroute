@@ -7,5 +7,7 @@
 
 mod oracle;
 mod shove;
+mod warp;
 
 pub use oracle::{Conflict, MoveOracle, scale};
+pub use warp::WarpField;

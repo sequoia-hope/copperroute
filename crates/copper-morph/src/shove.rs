@@ -79,7 +79,7 @@ impl MoveOracle {
     /// Dragged traces run straight from a pin's old place to its new one and may now crowd other
     /// copper; the DRC is the judge. Routable copper behind a new violation is ripped for the
     /// router when the oracle allows it; any violation left refuses the move.
-    fn settle_dragged_copper(&self, before: &mut Board, after: &mut Board) -> bool {
+    pub(crate) fn settle_dragged_copper(&self, before: &mut Board, after: &mut Board) -> bool {
         let known = violation_pairs(before);
         let fresh: Vec<(ItemId, Option<ItemId>)> = violation_pairs(after)
             .into_iter()
@@ -109,7 +109,7 @@ impl MoveOracle {
 
 /// The settle engine's net-length cap: no net of the moved parts may grow past
 /// `max(1.25 * L0, L0 + 4 mm)` of copper.
-fn within_length_caps(before: &Board, after: &Board, components: &[i32]) -> bool {
+pub(crate) fn within_length_caps(before: &Board, after: &Board, components: &[i32]) -> bool {
     let per_mm = before
         .communication
         .get_resolution(copper_board::structure::Unit::Mm);

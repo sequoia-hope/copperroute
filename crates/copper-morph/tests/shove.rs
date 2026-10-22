@@ -191,38 +191,6 @@ fn a_soft_move_onto_other_nets_copper_rips_it_and_adds_no_violation() {
 }
 
 #[test]
-#[ignore = "diagnostic: do soft moves land on other nets' copper"]
-fn print_soft_overrun() {
-    let mut board = routed_board();
-    let soft = MoveOracle {
-        guard: 0.0,
-        routable_copper_is_soft: true,
-    };
-    let span = board.bounding_box.ur.x - board.bounding_box.ll.x;
-    let ids: Vec<i32> = board
-        .components
-        .get_all()
-        .filter(|c| !c.position_fixed)
-        .map(|c| c.id)
-        .collect();
-    for (i, id) in ids.into_iter().enumerate().take(20) {
-        let by = if i % 2 == 0 {
-            IntVector::new(span / 10, 0)
-        } else {
-            IntVector::new(0, -span / 10)
-        };
-        let (fraction, _) = soft.line_search(&mut board, id, &by);
-        let step = copper_morph::scale(&by, fraction);
-        let foreign_before = board.get_items().filter(|x| x.is_trace()).count();
-        let ok = soft.translate(&mut board, id, &step);
-        let foreign_after = board.get_items().filter(|x| x.is_trace()).count();
-        eprintln!(
-            "c{id}: fraction {fraction:.2} ok {ok} traces {foreign_before} -> {foreign_after}"
-        );
-    }
-}
-
-#[test]
 fn placing_a_part_far_away_shoves_and_never_adds_a_violation() {
     let board = routed_board();
     let span = board.bounding_box.ur.x - board.bounding_box.ll.x;
@@ -365,4 +333,65 @@ fn accepted_drags_stay_within_the_net_length_cap() {
     }
     eprintln!("length caps: accepted {accepted}, refused {refused}");
     assert!(accepted > 0 && refused > 0);
+}
+
+#[test]
+fn warping_keeps_every_connection_adds_no_violation_and_bends_copper() {
+    let board = routed_board();
+    let oracle = MoveOracle {
+        guard: 0.0,
+        routable_copper_is_soft: false,
+    };
+    let span = board.bounding_box.ur.x - board.bounding_box.ll.x;
+    let ids: Vec<i32> = board
+        .components
+        .get_all()
+        .filter(|c| !c.position_fixed)
+        .map(|c| c.id)
+        .collect();
+    let (mut warped, mut shoved, mut bent) = (0, 0, 0);
+    for (i, &id) in ids.iter().enumerate().take(30) {
+        let by = match i % 4 {
+            0 => IntVector::new(span / 150, 0),
+            1 => IntVector::new(0, span / 150),
+            2 => IntVector::new(-span / 150, 0),
+            _ => IntVector::new(0, -span / 150),
+        };
+        let mut a = board.clone();
+        let before = violations(&mut a);
+        let open = unconnected(&mut a);
+        let traces_before: std::collections::BTreeSet<_> = a
+            .get_items()
+            .filter(|x| x.is_trace())
+            .map(|x| x.id())
+            .collect();
+        if oracle.translate_warping(&mut a, &[id], &by) {
+            warped += 1;
+            let added: Vec<_> = violations(&mut a).difference(&before).cloned().collect();
+            assert!(added.is_empty(), "warping {id} added {added:?}");
+            assert!(
+                unconnected(&mut a) <= open,
+                "warping {id} lost a connection"
+            );
+            let traces_after: std::collections::BTreeSet<_> = a
+                .get_items()
+                .filter(|x| x.is_trace())
+                .map(|x| x.id())
+                .collect();
+            if traces_before.difference(&traces_after).count() > 2 {
+                bent += 1;
+            }
+        }
+        let mut b = board.clone();
+        if oracle.translate_shoving(&mut b, &[id], &by) {
+            shoved += 1;
+        }
+    }
+    eprintln!(
+        "of 30 moves: warping accepted {warped} ({bent} bent other copper), shoving accepted {shoved}"
+    );
+    assert!(
+        warped > 0 && bent > 0,
+        "warping never moved copper; the test proves nothing"
+    );
 }
