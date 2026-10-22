@@ -177,7 +177,7 @@ fn default_settings_pins_every_java_value() {
     assert_eq!(s.hole_clearance_um, Some(0.0));
     assert_eq!(s.neck_width_um, Some(0.0));
     assert_eq!(s.strict_drc, Some(false));
-    assert_eq!(s.job_timeout_string.as_deref(), Some("12:00:00"));
+    assert_eq!(s.job_timeout_string.as_deref(), Some("00:30:00"));
     assert_eq!(s.max_passes, Some(9999));
     assert_eq!(s.max_items, Some(i32::MAX));
     assert_eq!(s.save_intermediate_stages, Some(false));

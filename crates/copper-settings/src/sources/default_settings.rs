@@ -39,7 +39,7 @@ impl DefaultSettings {
 
         settings.enabled = Some(true);
         settings.algorithm = Some(RouterSettings::ALGORITHM_CURRENT.to_string());
-        settings.job_timeout_string = Some("12:00:00".to_string());
+        settings.job_timeout_string = Some("00:30:00".to_string());
         settings.max_passes = Some(9999);
         settings.max_items = Some(i32::MAX);
         settings.trace_pull_tight_accuracy = Some(500);
