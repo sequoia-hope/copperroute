@@ -5,9 +5,11 @@
 
 use std::collections::BTreeSet;
 
+use copper_board::board::StopConnectionOption;
+use copper_board::items::Item;
 use copper_board::structure::{AngleRestriction, ShapeEntrySide};
 use copper_board::{Board, ItemId};
-use copper_geometry::{IntVector, TileShape, Vector};
+use copper_geometry::{IntPoint, IntVector, Point, TileShape, Vector};
 use copper_router::board_ext::ForcedPadRouter;
 
 use crate::oracle::MoveOracle;
@@ -48,9 +50,66 @@ impl MoveOracle {
                 return false;
             }
         }
+        if !self.settle_dragged_copper(board, &mut trial) {
+            return false;
+        }
         *board = trial;
         true
     }
+
+    /// Places the component with its location at `target`, shoving copper out of its footprint:
+    /// the settle engine's ghost, born full size because the shove engine moves copper
+    /// recursively instead of in small steps.
+    pub fn place_shoving(&self, board: &mut Board, component_id: i32, target: &IntPoint) -> bool {
+        let Some(Point::Int(location)) = board
+            .components
+            .get_all()
+            .find(|c| c.id == component_id)
+            .and_then(|c| c.get_location().cloned())
+        else {
+            return false;
+        };
+        let by = IntVector::new(target.x - location.x, target.y - location.y);
+        self.translate_shoving(board, &[component_id], &by)
+    }
+
+    /// Dragged traces run straight from a pin's old place to its new one and may now crowd other
+    /// copper; the DRC is the judge. Routable copper behind a new violation is ripped for the
+    /// router when the oracle allows it; any violation left refuses the move.
+    fn settle_dragged_copper(&self, before: &mut Board, after: &mut Board) -> bool {
+        let known = violation_pairs(before);
+        let fresh: Vec<(ItemId, Option<ItemId>)> = violation_pairs(after)
+            .into_iter()
+            .filter(|pair| !known.contains(pair))
+            .collect();
+        if fresh.is_empty() {
+            return true;
+        }
+        if !self.routable_copper_is_soft {
+            return false;
+        }
+        let mut ripped = BTreeSet::new();
+        for (a, b) in fresh {
+            for id in std::iter::once(a).chain(b) {
+                if after.get_item(id).is_some_and(Item::is_routable) {
+                    ripped.extend(after.connection_items(id, StopConnectionOption::None));
+                }
+            }
+        }
+        ripped.retain(|id| after.get_item(*id).is_some_and(Item::is_routable));
+        after.remove_items(ripped);
+        violation_pairs(after)
+            .iter()
+            .all(|pair| known.contains(pair))
+    }
+}
+
+fn violation_pairs(board: &mut Board) -> BTreeSet<(ItemId, Option<ItemId>)> {
+    copper_drc::DesignRulesChecker::new(board)
+        .get_all_violations()
+        .into_iter()
+        .map(|v| (v.first_item, v.second_item))
+        .collect()
 }
 
 fn shove_out_of_the_way(board: &mut Board, components: &[i32], by: &IntVector) -> bool {
@@ -111,4 +170,90 @@ fn shove_out_of_the_way(board: &mut Board, components: &[i32], by: &IntVector) -
         }
     }
     true
+}
+
+impl MoveOracle {
+    /// The settle engine's ghost site search: the place where the part's pins centre on the pins
+    /// it connects to, or the nearest admissible place to it within `radius`, scanned on a grid
+    /// of `pitch` and tried nearest first with `place_shoving`. Returns the move made.
+    pub fn place_near_partners(
+        &self,
+        board: &mut Board,
+        component_id: i32,
+        radius: i32,
+        pitch: i32,
+        attempts: usize,
+    ) -> Option<IntVector> {
+        let ideal = partner_offset(board, component_id)?;
+        let fixed_only = MoveOracle {
+            routable_copper_is_soft: true,
+            ..*self
+        };
+        let base = fixed_only.conflicts(board, component_id, &IntVector::ZERO);
+        let steps = (radius / pitch.max(1)).max(0);
+        let mut candidates: Vec<IntVector> = Vec::new();
+        for i in -steps..=steps {
+            for j in -steps..=steps {
+                let offset = IntVector::new(ideal.x + i * pitch, ideal.y + j * pitch);
+                if f64::from(i * pitch).hypot(f64::from(j * pitch)) <= f64::from(radius) {
+                    candidates.push(offset);
+                }
+            }
+        }
+        candidates.sort_by_key(|v| {
+            let (dx, dy) = (i64::from(v.x - ideal.x), i64::from(v.y - ideal.y));
+            dx * dx + dy * dy
+        });
+        let mut tried = 0;
+        for by in candidates {
+            if tried >= attempts {
+                break;
+            }
+            if !fixed_only
+                .conflicts(board, component_id, &by)
+                .is_subset(&base)
+            {
+                continue;
+            }
+            tried += 1;
+            if self.translate_shoving(board, &[component_id], &by) {
+                return Some(by);
+            }
+        }
+        None
+    }
+}
+
+/// The move that would put the centroid of the part's pins on the centroid of the pins they
+/// connect to on other parts.
+fn partner_offset(board: &Board, component_id: i32) -> Option<IntVector> {
+    let own: Vec<&Item> = board
+        .get_items()
+        .filter(|i| i.component_id() == component_id && i.is_drill_item())
+        .collect();
+    let nets: BTreeSet<i32> = own.iter().flat_map(|i| i.net_nos().to_vec()).collect();
+    let centroid = |items: &mut dyn Iterator<Item = &Item>| -> Option<(f64, f64)> {
+        let (mut x, mut y, mut n) = (0.0, 0.0, 0.0);
+        for item in items {
+            let Some(center) = board.drill_center(item.id()) else {
+                continue;
+            };
+            let c = center.to_float();
+            x += c.x;
+            y += c.y;
+            n += 1.0;
+        }
+        (n > 0.0).then(|| (x / n, y / n))
+    };
+    let mine = centroid(&mut own.iter().copied())?;
+    let theirs = centroid(&mut board.get_items().filter(|i| {
+        i.is_drill_item()
+            && i.component_id() > 0
+            && i.component_id() != component_id
+            && i.net_nos().iter().any(|n| nets.contains(n))
+    }))?;
+    Some(IntVector::new(
+        (theirs.0 - mine.0).round() as i32,
+        (theirs.1 - mine.1).round() as i32,
+    ))
 }

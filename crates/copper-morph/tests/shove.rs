@@ -221,3 +221,92 @@ fn print_soft_overrun() {
         );
     }
 }
+
+#[test]
+fn placing_a_part_far_away_shoves_and_never_adds_a_violation() {
+    let board = routed_board();
+    let span = board.bounding_box.ur.x - board.bounding_box.ll.x;
+    let ids: Vec<i32> = board
+        .components
+        .get_all()
+        .filter(|c| !c.position_fixed)
+        .map(|c| c.id)
+        .collect();
+    let mut placed = 0;
+    for soft in [false, true] {
+        let oracle = MoveOracle {
+            guard: 0.0,
+            routable_copper_is_soft: soft,
+        };
+        for &id in ids.iter().take(10) {
+            let mut trial = board.clone();
+            let before = violations(&mut trial);
+            let open_before = unconnected(&mut trial);
+            let Some(copper_geometry::Point::Int(at)) = trial
+                .components
+                .get_all()
+                .find(|c| c.id == id)
+                .and_then(|c| c.get_location().cloned())
+            else {
+                continue;
+            };
+            let target = copper_geometry::IntPoint::new(at.x + span / 12, at.y - span / 15);
+            if oracle.place_shoving(&mut trial, id, &target) {
+                placed += 1;
+                let added: Vec<_> = violations(&mut trial)
+                    .difference(&before)
+                    .cloned()
+                    .collect();
+                assert!(
+                    added.is_empty(),
+                    "placing {id} (soft {soft}) added {added:?}"
+                );
+                if !soft {
+                    assert!(
+                        unconnected(&mut trial) <= open_before,
+                        "placing {id} hard lost a connection"
+                    );
+                }
+            }
+        }
+    }
+    eprintln!("placed {placed} of 20 attempts");
+    assert!(
+        placed > 0,
+        "nothing could be placed; the test proves nothing"
+    );
+}
+
+#[test]
+fn a_site_search_places_parts_near_their_partners_without_new_violations() {
+    let board = routed_board();
+    let span = board.bounding_box.ur.x - board.bounding_box.ll.x;
+    let ids: Vec<i32> = board
+        .components
+        .get_all()
+        .filter(|c| !c.position_fixed)
+        .map(|c| c.id)
+        .collect();
+    let oracle = MoveOracle {
+        guard: 0.0,
+        routable_copper_is_soft: true,
+    };
+    let mut placed = 0;
+    for &id in ids.iter().take(12) {
+        let mut trial = board.clone();
+        let before = violations(&mut trial);
+        if let Some(by) = oracle.place_near_partners(&mut trial, id, span / 10, span / 100, 8) {
+            if f64::from(by.x).hypot(f64::from(by.y)) < f64::from(span / 100) {
+                continue;
+            }
+            placed += 1;
+            let added: Vec<_> = violations(&mut trial)
+                .difference(&before)
+                .cloned()
+                .collect();
+            assert!(added.is_empty(), "placing {id} by {by:?} added {added:?}");
+        }
+    }
+    eprintln!("site search placed {placed} of 12");
+    assert!(placed >= 3, "site search placed only {placed} of 12");
+}
