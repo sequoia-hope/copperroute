@@ -161,7 +161,7 @@ fn commit(board: &mut Board, grid: &RouteGrid, path: &GridPath, from: ItemId, to
     let mut runs: Vec<(usize, Vec<Point>)> = Vec::new();
     let mut vias = Vec::new();
     let mut run: Vec<(usize, usize, usize)> = Vec::new();
-    let mut close = |run: &[(usize, usize, usize)], runs: &mut Vec<(usize, Vec<Point>)>| {
+    let close = |run: &[(usize, usize, usize)], runs: &mut Vec<(usize, Vec<Point>)>| {
         let mut points = vec![point(&run[0])];
         for k in 1..run.len().saturating_sub(1) {
             let (a, b, c) = (run[k - 1], run[k], run[k + 1]);
