@@ -30,7 +30,7 @@ impl MoveOracle {
         component_id: i32,
         by: &IntVector,
     ) -> BTreeSet<Conflict> {
-        self.shortfalls(board, component_id, by)
+        self.shortfalls(board, &[component_id], by)
             .into_keys()
             .collect()
     }
@@ -43,7 +43,7 @@ impl MoveOracle {
     fn shortfalls(
         &self,
         board: &mut Board,
-        component_id: i32,
+        components: &[i32],
         by: &IntVector,
     ) -> BTreeMap<Conflict, f64> {
         let constraints = copper_drc::constraints::resolve(board);
@@ -57,10 +57,7 @@ impl MoveOracle {
                 .unwrap_or(0),
         ) + self.guard;
         let tolerance = f64::from(constraints.epsilon);
-        let members: BTreeSet<ItemId> = board
-            .get_component_items(component_id)
-            .into_iter()
-            .collect();
+        let members = group_items(board, components);
         let vector = Vector::Int(*by);
         let mut found: BTreeMap<Conflict, f64> = BTreeMap::new();
         let mut note = |pair: Conflict, margin: f64| {
@@ -155,10 +152,20 @@ impl MoveOracle {
         component_id: i32,
         by: &IntVector,
     ) -> (f64, BTreeSet<Conflict>) {
-        let base = self.shortfalls(board, component_id, &IntVector::ZERO);
+        self.line_search_group(board, &[component_id], by)
+    }
+
+    /// `line_search` for parts moving together: pairs inside the group never conflict.
+    pub fn line_search_group(
+        &self,
+        board: &mut Board,
+        components: &[i32],
+        by: &IntVector,
+    ) -> (f64, BTreeSet<Conflict>) {
+        let base = self.shortfalls(board, components, &IntVector::ZERO);
         let failing = |oracle: &Self, board: &mut Board, fraction: f64| -> BTreeSet<Conflict> {
             oracle
-                .shortfalls(board, component_id, &scale(by, fraction))
+                .shortfalls(board, components, &scale(by, fraction))
                 .into_iter()
                 .filter(|(pair, margin)| base.get(pair).is_none_or(|before| *margin < before - 1.0))
                 .map(|(pair, _)| pair)
@@ -186,14 +193,15 @@ impl MoveOracle {
     /// its pins is ripped first, so nothing is dragged into places the oracle never checked; the
     /// router reroutes it. Refuses (returns false) when fixed copper is attached.
     pub fn translate(&self, board: &mut Board, component_id: i32, by: &IntVector) -> bool {
+        self.translate_group(board, &[component_id], by)
+    }
+
+    pub fn translate_group(&self, board: &mut Board, components: &[i32], by: &IntVector) -> bool {
         if *by == IntVector::ZERO {
             return true;
         }
         let vector = Vector::Int(*by);
-        let members: BTreeSet<ItemId> = board
-            .get_component_items(component_id)
-            .into_iter()
-            .collect();
+        let members = group_items(board, components);
         let attached = attached_copper(board, &members);
         if attached.iter().any(|(_, c)| {
             !(self.routable_copper_is_soft && board.get_item(*c).is_some_and(Item::is_routable))
@@ -208,7 +216,9 @@ impl MoveOracle {
         board.remove_items(ripped);
         // Pin shapes derive from the component's location, so it must move before the items are
         // re-entered into the search trees.
-        board.components.move_component(component_id, &vector);
+        for &component_id in components {
+            board.components.move_component(component_id, &vector);
+        }
         for id in members {
             if !matches!(board.move_item_by(id, &vector), Ok(true)) {
                 return false;
@@ -277,6 +287,47 @@ impl MoveOracle {
     ) {
         if *step != IntVector::ZERO && self.translate(board, component_id, step) {
             moves.push((component_id, *step));
+        }
+    }
+}
+
+fn group_items(board: &Board, components: &[i32]) -> BTreeSet<ItemId> {
+    components
+        .iter()
+        .flat_map(|c| board.get_component_items(*c))
+        .collect()
+}
+
+impl MoveOracle {
+    /// The settle engine's group step: the part plus the free parts that wedge it (transitively,
+    /// up to `max_members`) move together as far as admissible. Returns the group and the step.
+    pub fn group_step(
+        &self,
+        board: &mut Board,
+        component_id: i32,
+        by: &IntVector,
+        max_members: usize,
+    ) -> (Vec<i32>, IntVector) {
+        let mut group = vec![component_id];
+        let mut frontier = vec![component_id];
+        while let Some(current) = frontier.pop() {
+            let (fraction, blockers) = self.line_search_group(board, &[current], by);
+            if fraction >= 1.0 {
+                continue;
+            }
+            for blocker in blocking_components(board, &blockers) {
+                if group.len() < max_members && !group.contains(&blocker) {
+                    group.push(blocker);
+                    frontier.push(blocker);
+                }
+            }
+        }
+        let (fraction, _) = self.line_search_group(board, &group, by);
+        let step = scale(by, fraction);
+        if step != IntVector::ZERO && self.translate_group(board, &group, &step) {
+            (group, step)
+        } else {
+            (group, IntVector::ZERO)
         }
     }
 }

@@ -400,3 +400,38 @@ fn every_item_shape_moves_by_exactly_the_vector() {
         );
     }
 }
+
+#[test]
+fn a_group_step_moves_wedged_parts_together_without_new_violations() {
+    let mut board = read_board("Issue508-DAC2020_bm05.dsn");
+    let oracle = oracle();
+    let span = board.bounding_box.ur.x - board.bounding_box.ll.x;
+    let want = IntVector::new(span / 8, 0);
+    let pairs = |board: &mut Board| -> std::collections::BTreeSet<(
+        copper_board::ItemId,
+        Option<copper_board::ItemId>,
+        String,
+    )> {
+        copper_drc::DesignRulesChecker::new(board)
+            .get_all_violations()
+            .into_iter()
+            .map(|v| (v.first_item, v.second_item, format!("{:?}", v.kind)))
+            .collect()
+    };
+    let before = pairs(&mut board);
+    let mut convoys = 0;
+    for id in movable_components(&board) {
+        let (plain, _) = oracle.line_search(&mut board.clone(), id, &want);
+        if plain >= 1.0 {
+            continue;
+        }
+        let mut trial = board.clone();
+        let (group, step) = oracle.group_step(&mut trial, id, &want, 6);
+        if group.len() > 1 && f64::from(step.x) > plain * f64::from(want.x) + 1.0 {
+            convoys += 1;
+            let added: Vec<_> = pairs(&mut trial).difference(&before).cloned().collect();
+            assert!(added.is_empty(), "group {group:?} added {added:?}");
+        }
+    }
+    assert!(convoys > 0, "no group got further than its lead part alone");
+}
