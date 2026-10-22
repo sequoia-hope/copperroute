@@ -684,17 +684,19 @@ impl MazeSearchEngine<'_> {
         }
 
         // :875-882.
-        let expansion_value = from_element.expansion_value
-            + f64::from(add_costs)
-            + bend_cost_penalty
-            + self.ctrl.movement_cost(
-                &shape_entry_middle,
-                &from_element
-                    .shape_entry
-                    .a
-                    .middle_point(&from_element.shape_entry.b),
+        let from_middle = from_element
+            .shape_entry
+            .a
+            .middle_point(&from_element.shape_entry.b);
+        let movement = self
+            .ctrl
+            .movement_cost(&shape_entry_middle, &from_middle, layer)
+            * super::region_history::cost_multiplier(
+                &shape_entry_middle.middle_point(&from_middle),
                 layer,
             );
+        let expansion_value =
+            from_element.expansion_value + f64::from(add_costs) + bend_cost_penalty + movement;
         // :883-884.
         let sorting_value = expansion_value + self.heuristic(&shape_entry_middle, layer);
         // :885-887.

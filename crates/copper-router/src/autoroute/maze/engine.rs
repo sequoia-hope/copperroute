@@ -883,6 +883,14 @@ impl AutorouteEngine {
             let Some(item) = board.get_item(*current_ripped_item) else {
                 continue;
             };
+            if super::region_history::enabled() {
+                let ctx = board.ctx();
+                super::region_history::record(
+                    &item.bounding_box(&ctx),
+                    item.first_layer(&ctx),
+                    item.last_layer(&ctx),
+                );
+            }
             for i in 0..item.net_count() {
                 changed_nets.insert(item.get_net_number(i));
             }

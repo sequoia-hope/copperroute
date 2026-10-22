@@ -20,6 +20,7 @@ pub fn run_pipeline(
     crate::pipeline::raise_to_project_minimums(board);
     crate::autoroute::maze::ripup_history::reset();
     crate::autoroute::maze::coarse_field::reset();
+    crate::autoroute::maze::region_history::reset(&board.bounding_box);
     let router_enabled =
         settings.get_run_router() && settings.max_passes.is_none_or(|max| max >= 0);
 

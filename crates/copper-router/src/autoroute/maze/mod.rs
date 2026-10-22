@@ -7,6 +7,7 @@ pub mod expand;
 pub mod expansion_engine;
 pub mod list_element;
 pub mod queue;
+pub mod region_history;
 pub mod ripup_history;
 pub mod ripup_resolver;
 pub mod search;
