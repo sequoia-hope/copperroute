@@ -310,3 +310,59 @@ fn a_site_search_places_parts_near_their_partners_without_new_violations() {
     eprintln!("site search placed {placed} of 12");
     assert!(placed >= 3, "site search placed only {placed} of 12");
 }
+
+/// An invariant check only: on this board the DRC refuses every drag long enough to reach the
+/// cap, so the cap itself never binds here.
+#[test]
+fn accepted_drags_stay_within_the_net_length_cap() {
+    let board = routed_board();
+    let per_mm = board
+        .communication
+        .get_resolution(copper_board::structure::Unit::Mm);
+    let length = |board: &Board, net: i32| -> f64 {
+        board
+            .get_items()
+            .filter_map(|i| match i {
+                copper_board::items::Item::Trace(t) if i.contains_net(net) => Some(t.get_length()),
+                _ => None,
+            })
+            .sum()
+    };
+    let oracle = MoveOracle {
+        guard: 0.0,
+        routable_copper_is_soft: false,
+    };
+    let ids: Vec<i32> = board
+        .components
+        .get_all()
+        .filter(|c| !c.position_fixed)
+        .map(|c| c.id)
+        .collect();
+    let (mut refused, mut accepted) = (0, 0);
+    for &id in ids.iter().take(20) {
+        for mm in [1.0, 3.0, 8.0] {
+            let mut trial = board.clone();
+            let nets: std::collections::BTreeSet<i32> = trial
+                .get_component_items(id)
+                .iter()
+                .filter_map(|i| trial.get_item(*i))
+                .flat_map(|i| i.net_nos().to_vec())
+                .collect();
+            let by = IntVector::new((mm * per_mm) as i32, 0);
+            if oracle.translate_shoving(&mut trial, &[id], &by) {
+                accepted += 1;
+                for net in nets {
+                    let (l0, l1) = (length(&board, net), length(&trial, net));
+                    assert!(
+                        l1 <= (1.25 * l0).max(l0 + 4.0 * per_mm) + 1.0,
+                        "net {net} grew {l0} -> {l1} moving {id} {mm} mm"
+                    );
+                }
+            } else {
+                refused += 1;
+            }
+        }
+    }
+    eprintln!("length caps: accepted {accepted}, refused {refused}");
+    assert!(accepted > 0 && refused > 0);
+}

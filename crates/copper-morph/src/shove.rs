@@ -53,6 +53,9 @@ impl MoveOracle {
         if !self.settle_dragged_copper(board, &mut trial) {
             return false;
         }
+        if !within_length_caps(board, &trial, components) {
+            return false;
+        }
         *board = trial;
         true
     }
@@ -102,6 +105,34 @@ impl MoveOracle {
             .iter()
             .all(|pair| known.contains(pair))
     }
+}
+
+/// The settle engine's net-length cap: no net of the moved parts may grow past
+/// `max(1.25 * L0, L0 + 4 mm)` of copper.
+fn within_length_caps(before: &Board, after: &Board, components: &[i32]) -> bool {
+    let per_mm = before
+        .communication
+        .get_resolution(copper_board::structure::Unit::Mm);
+    let nets: BTreeSet<i32> = components
+        .iter()
+        .flat_map(|c| before.get_component_items(*c))
+        .filter_map(|id| before.get_item(id))
+        .flat_map(|item| item.net_nos().to_vec())
+        .collect();
+    nets.into_iter().all(|net| {
+        let start = net_length(before, net);
+        net_length(after, net) <= (1.25 * start).max(start + 4.0 * per_mm)
+    })
+}
+
+fn net_length(board: &Board, net: i32) -> f64 {
+    board
+        .get_items()
+        .filter_map(|item| match item {
+            Item::Trace(trace) if item.contains_net(net) => Some(trace.get_length()),
+            _ => None,
+        })
+        .sum()
 }
 
 fn violation_pairs(board: &mut Board) -> BTreeSet<(ItemId, Option<ItemId>)> {
