@@ -1,3 +1,4 @@
+pub mod coarse_field;
 pub mod control;
 mod corridor;
 pub mod destination_distance;

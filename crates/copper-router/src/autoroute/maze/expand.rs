@@ -696,10 +696,7 @@ impl MazeSearchEngine<'_> {
                 layer,
             );
         // :883-884.
-        let sorting_value = expansion_value
-            + self
-                .destination_distance
-                .calculate_from_point(&shape_entry_middle, layer);
+        let sorting_value = expansion_value + self.heuristic(&shape_entry_middle, layer);
         // :885-887.
         let room_ripped = add_costs > 0 && adjustment == MazeAdjustment::None
             || from_element.already_checked && from_element.room_ripped;

@@ -26,6 +26,8 @@ pub struct MazeSearchEngine<'a> {
 
     pub destination_distance: DestinationDistance,
 
+    coarse_field: Option<super::coarse_field::CoarseField>,
+
     pub search_tree: TreeId,
 
     pub random_generator: SplitMix64,
@@ -51,6 +53,7 @@ impl<'a> MazeSearchEngine<'a> {
                 ctrl.min_normal_via_cost,
                 ctrl.min_cheap_via_cost,
             ),
+            coarse_field: None,
             ctrl,
             queue: MazeQueue::new(),
             random_generator,
@@ -72,6 +75,19 @@ impl<'a> MazeSearchEngine<'a> {
             Some(new_instance)
         } else {
             None
+        }
+    }
+
+    /// An admissible estimate of the cost from `point` to the destination.
+    pub fn heuristic(&self, point: &FloatPoint, layer: usize) -> f64 {
+        let box_distance = self.destination_distance.calculate_from_point(point, layer);
+        match self
+            .coarse_field
+            .as_ref()
+            .and_then(|f| f.lower_bound(point, layer))
+        {
+            Some(coarse) => box_distance.max(coarse),
+            None => box_distance,
         }
     }
 
@@ -108,6 +124,7 @@ impl<'a> MazeSearchEngine<'a> {
         );
 
         let mut destination_ok = false;
+        let mut destination_shapes = Vec::new();
         for current_item in destination_items.iter().rev().copied() {
             if self.engine.is_stop_requested(stop) {
                 return false;
@@ -126,6 +143,7 @@ impl<'a> MazeSearchEngine<'a> {
                     });
                     self.destination_distance
                         .join(&current_tree_shape.bounding_box(), layer);
+                    destination_shapes.push((current_tree_shape.bounding_box(), layer));
                 }
                 i += 1;
             }
@@ -142,6 +160,14 @@ impl<'a> MazeSearchEngine<'a> {
 
         if !destination_ok {
             return false;
+        }
+        if super::coarse_field::enabled() && !self.ctrl.is_fanout {
+            self.coarse_field = super::coarse_field::CoarseField::build(
+                board,
+                self.search_tree,
+                self.ctrl,
+                &destination_shapes,
+            );
         }
 
         let mut start_rooms = Vec::new();
@@ -272,9 +298,21 @@ impl<'a> MazeSearchEngine<'a> {
                     .complete_room(current_room)
                     .expect("just read")
                     .get_layer();
-                let sorting_value = self
-                    .destination_distance
-                    .calculate_from_point(&current_center, layer);
+                let sorting_value = self.heuristic(&current_center, layer);
+                if let Some(field) = self
+                    .coarse_field
+                    .as_ref()
+                    .filter(|_| self.ctrl.layer_active[layer])
+                {
+                    super::coarse_field::record_start(
+                        self.destination_distance
+                            .calculate_from_point(&current_center, layer),
+                        field.lower_bound(&current_center, layer),
+                        self.ctrl.net_number,
+                        &current_center,
+                        layer,
+                    );
+                }
                 let new_list_element = MazeListElement {
                     door: ExpandableRef::TargetDoor(current_door),
                     section_no_of_door: 0,
