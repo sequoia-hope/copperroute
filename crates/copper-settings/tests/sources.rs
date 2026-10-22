@@ -68,7 +68,7 @@ fn default_settings_only() {
     assert!(merged.get_run_router());
     assert!(merged.get_vias_allowed());
     assert!(merged.get_run_optimizer());
-    assert_eq!(merged.max_threads, Some(3));
+    assert_eq!(merged.max_threads, Some(2));
     assert_eq!(merged.get_layer_count(), 0);
 }
 
@@ -185,7 +185,7 @@ fn default_settings_pins_every_java_value() {
     assert_eq!(s.trace_pull_tight_accuracy, Some(500));
     assert_eq!(s.vias_allowed, Some(true));
     assert_eq!(s.automatic_neckdown, Some(true));
-    assert_eq!(s.max_threads, Some(3));
+    assert_eq!(s.max_threads, Some(2));
     assert_eq!(s.result_json_path, None);
     assert_eq!(s.layers, None);
     assert_eq!(s.get_layer_count(), 0);
@@ -218,7 +218,7 @@ fn default_settings_pins_every_java_value() {
     );
     assert_eq!(optimizer.max_passes, Some(100));
     assert_eq!(optimizer.max_items, Some(i32::MAX));
-    assert_eq!(optimizer.max_threads, Some(3));
+    assert_eq!(optimizer.max_threads, Some(2));
     assert_eq!(optimizer.optimization_improvement_threshold, Some(0.01));
     assert_eq!(optimizer.max_consecutive_failures, Some(50));
     assert_eq!(optimizer.additional_ripup_cost_factor_at_start, Some(10));

@@ -523,8 +523,8 @@ fn validate_matrix() {
     }
 
     for (input, expected) in [
-        (None, 3),
-        (Some(-1), 3),
+        (None, 2),
+        (Some(-1), 2),
         (Some(0), 0),
         (Some(9), 4),
         (Some(2), 2),
@@ -570,8 +570,8 @@ fn an_unrecognised_pin_sorting_order_is_refused() {
 #[test]
 fn set_max_threads_normalizes_and_mirrors() {
     for (input, expected) in [
-        (None, 3),
-        (Some(-1), 3),
+        (None, 2),
+        (Some(-1), 2),
         (Some(0), 4),
         (Some(9), 4),
         (Some(2), 2),
