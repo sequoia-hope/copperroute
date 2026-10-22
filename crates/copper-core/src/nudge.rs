@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use copper_board::Board;
 use copper_board::structure::Unit;
 use copper_geometry::IntVector;
-use copper_morph::{MoveOracle, scale};
+use copper_morph::MoveOracle;
 use copper_router::RouterError;
 use copper_router::pipeline::{
     NoopProgressSink, PipelineResult, ProgressSink, RouterBudget, RouterStop, run_pipeline,
@@ -32,6 +32,7 @@ const TRIAL_PASSES: i32 = 6;
 const TRIAL_MS: i32 = 20_000;
 const ROUNDS: usize = 2;
 const PARTS_PER_ROUND: usize = 4;
+const PUSH_DEPTH: usize = 1;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NudgeBackend;
@@ -84,13 +85,14 @@ impl RouterBackend for NudgeBackend {
                             (dy * distance * per_mm).round() as i32,
                         );
                         let mut trial = board.clone();
-                        let (fraction, _) = oracle.line_search(&mut trial, component, &want);
-                        let step = scale(&want, fraction);
+                        let moves = oracle.push(&mut trial, component, &want, PUSH_DEPTH);
+                        let Some(&(_, step)) = moves.iter().rev().find(|(c, _)| *c == component)
+                        else {
+                            continue;
+                        };
                         let moved_mm = f64::from(step.x).hypot(f64::from(step.y))
                             / per_mm.max(f64::MIN_POSITIVE);
-                        if moved_mm < SMALLEST_MOVE_MM
-                            || !oracle.translate(&mut trial, component, &step)
-                        {
+                        if moved_mm < SMALLEST_MOVE_MM {
                             continue;
                         }
                         let trial_stop = RouterStop::with_deadline(TRIAL_MS);
