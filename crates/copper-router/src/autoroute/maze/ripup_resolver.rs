@@ -162,6 +162,13 @@ impl MazeRipupResolver {
         }
         ripup_cost /= detour;
         ripup_cost *= fanout_via_cost_factor;
+        if super::ripup_history::enabled()
+            && let Some(item) = board.get_item(obstacle_item)
+        {
+            ripup_cost *= super::ripup_history::cost_multiplier(
+                (0..item.net_count()).map(|i| item.get_net_number(i)),
+            );
+        }
         let result = (ripup_cost as i32).max(1);
         let max_ripup_costs = i32::MAX / 100;
         result.min(max_ripup_costs)

@@ -887,6 +887,9 @@ impl AutorouteEngine {
                 changed_nets.insert(item.get_net_number(i));
             }
         }
+        for net_no in &changed_nets {
+            super::ripup_history::record(*net_no);
+        }
 
         board.remove_items(ripped_connections.iter().rev().copied());
         if !ripped_connections.is_empty() {

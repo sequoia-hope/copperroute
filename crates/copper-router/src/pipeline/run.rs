@@ -18,6 +18,7 @@ pub fn run_pipeline(
 ) -> Result<PipelineResult, RouterError> {
     // Project constraints can be attached after the board was prepared.
     crate::pipeline::raise_to_project_minimums(board);
+    crate::autoroute::maze::ripup_history::reset();
     let router_enabled =
         settings.get_run_router() && settings.max_passes.is_none_or(|max| max >= 0);
 
