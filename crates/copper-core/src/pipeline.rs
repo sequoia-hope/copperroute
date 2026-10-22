@@ -20,8 +20,9 @@ impl RoutingPipeline {
         sink: &mut dyn copper_router::pipeline::ProgressSink,
     ) -> Result<RoutingResult, Error> {
         let stop = ctx.cancel.as_router_stop();
-        let pipeline =
-            copper_router::pipeline::run_pipeline(board, ctx.settings, &stop, ctx.budget, sink)?;
+        let pipeline = ctx
+            .backend
+            .route(board, ctx.settings, &stop, ctx.budget, sink)?;
 
         let unrouted_report = copper_router::pipeline::build_unrouted_report(board);
 

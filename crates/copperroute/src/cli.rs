@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::ops::route::OutputFormat;
+use copper_core::RouterBackend;
 use copper_governor::MemoryCeiling;
 
 #[derive(Parser, Debug)]
@@ -70,6 +71,9 @@ pub struct RouteArgs {
     /// Write the result manifest here.
     #[arg(long)]
     pub result_json: Option<PathBuf>,
+    /// The routing approach to run.
+    #[arg(long, default_value = copper_core::DEFAULT_BACKEND, value_parser = parse_backend)]
+    pub backend: &'static dyn RouterBackend,
     /// Override one setting: --set router.<section>.<field>=<value>. Repeatable.
     /// router.max_items=N stops the optimizer as well as the router; --max-passes stops
     /// only the router.
@@ -115,6 +119,16 @@ pub struct InfoArgs {
     /// A KiCad .kicad_pro whose design rules are applied before summarising.
     #[arg(long)]
     pub kicad_project: Option<PathBuf>,
+}
+
+fn parse_backend(value: &str) -> Result<&'static dyn RouterBackend, String> {
+    copper_core::backend(value).ok_or_else(|| {
+        let known: Vec<_> = copper_core::backends()
+            .iter()
+            .map(|b| format!("{} ({})", b.name(), b.summary()))
+            .collect();
+        format!("unknown backend '{value}'; known: {}", known.join(", "))
+    })
 }
 
 fn parse_output_path(value: &str) -> Result<PathBuf, String> {
@@ -246,6 +260,23 @@ mod tests {
             Cli::try_parse_from(["copperroute", "mcp"]).unwrap().command,
             Command::Mcp
         ));
+    }
+
+    #[test]
+    fn backend_defaults_to_maze_and_rejects_unknown_names() {
+        let parse = |extra: &[&str]| {
+            let base = ["copperroute", "route", "a.dsn", "-o", "b.ses"];
+            Cli::try_parse_from(base.iter().chain(extra))
+        };
+        let Command::Route(r) = parse(&[]).unwrap().command else {
+            panic!("expected route")
+        };
+        assert_eq!(r.backend.name(), "maze");
+        let Command::Route(r) = parse(&["--backend", "none"]).unwrap().command else {
+            panic!("expected route")
+        };
+        assert_eq!(r.backend.name(), "none");
+        assert!(parse(&["--backend", "quantum"]).is_err());
     }
 
     #[test]

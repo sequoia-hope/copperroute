@@ -39,6 +39,7 @@ pub fn run(cli: &Cli, args: &RouteArgs, memory_ceiling: Option<u64>) -> ExitCode
         progress: SyncProgressSink::noop(),
         visualize,
         memory_ceiling,
+        backend: args.backend,
     }) {
         Ok(outcome) => outcome,
         Err(error) => {

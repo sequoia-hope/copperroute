@@ -28,6 +28,7 @@ fn request(dsn: PathBuf, output: OutputTarget, set: Vec<String>) -> RouteRequest
         progress: copper_core::SyncProgressSink::noop(),
         visualize: None,
         memory_ceiling: None,
+        backend: &copper_core::MazeBackend,
     }
 }
 

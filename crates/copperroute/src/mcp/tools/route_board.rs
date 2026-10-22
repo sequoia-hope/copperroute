@@ -35,6 +35,7 @@ pub fn run(
         progress: progress_sink(progress),
         visualize: None,
         memory_ceiling: state.memory_ceiling,
+        backend: &copper_core::MazeBackend,
     })
     .map_err(super::rpc_error)?;
     outcome.job.id = super::mint_job_id();

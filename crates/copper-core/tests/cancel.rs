@@ -196,6 +196,7 @@ fn route_with(token: &CancelToken, sink: &SyncProgressSink) -> Run {
         cancel: token.clone(),
         progress: sink,
         budget: copper_core::RouterBudget::disabled(),
+        backend: &copper_core::MazeBackend,
     };
     let result = RoutingPipeline::run(&mut board, &ctx).expect("the stem has a routable layer");
     Run {

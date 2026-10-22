@@ -5,7 +5,7 @@ use copper_governor::{MemoryGuard, MemoryPressure};
 
 use copper_core::{
     BoardFileDetails, CancelToken, Ctx, FileFormat, JobStopReason, RouterBudget, RoutingJob,
-    RoutingJobState, RoutingPipeline, RoutingResult, SyncProgressSink,
+    RouterBackend, RoutingJobState, RoutingPipeline, RoutingResult, SyncProgressSink,
 };
 use copper_router::{RoutingVisualizationOptions, RoutingVisualizationSummary};
 use copper_settings::RouterSettings;
@@ -57,6 +57,7 @@ pub struct RouteRequest {
     pub progress: SyncProgressSink,
     pub visualize: Option<RoutingVisualizationOptions>,
     pub memory_ceiling: Option<u64>,
+    pub backend: &'static dyn RouterBackend,
 }
 
 pub struct RouteOutcome {
@@ -125,6 +126,7 @@ pub fn route(request: RouteRequest) -> Result<RouteOutcome, OpError> {
         cancel,
         progress: &request.progress,
         budget: budget_for(&settings),
+        backend: request.backend,
     };
     let guard = request
         .memory_ceiling

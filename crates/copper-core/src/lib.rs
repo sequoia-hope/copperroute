@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod backend;
 pub mod cancel;
 pub mod ctx;
 pub mod file_details;
@@ -14,6 +15,9 @@ pub mod stats_json;
 pub mod summary;
 pub mod timespan;
 
+pub use backend::{
+    DEFAULT_BACKEND, MazeBackend, NoneBackend, RouterBackend, backend, backends,
+};
 pub use cancel::{CancelToken, Deadline, JobStopReason};
 pub use ctx::{Ctx, RoutingResult};
 pub use file_details::BoardFileDetails;

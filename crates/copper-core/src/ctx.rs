@@ -1,3 +1,4 @@
+use crate::backend::{MazeBackend, RouterBackend};
 use crate::cancel::{CancelToken, JobStopReason};
 use crate::progress::SyncProgressSink;
 
@@ -7,6 +8,7 @@ pub struct Ctx<'a> {
     pub cancel: CancelToken,
     pub progress: &'a SyncProgressSink,
     pub budget: copper_router::pipeline::RouterBudget,
+    pub backend: &'static dyn RouterBackend,
 }
 
 impl<'a> Ctx<'a> {
@@ -19,6 +21,7 @@ impl<'a> Ctx<'a> {
             cancel: CancelToken::new(),
             progress,
             budget: copper_router::pipeline::RouterBudget::default(),
+            backend: &MazeBackend,
         }
     }
 
