@@ -6,8 +6,10 @@
 //! grandfathered, so a board that is not DRC-clean can still be nudged without being made worse.
 
 mod oracle;
+mod settle;
 mod shove;
 mod warp;
 
 pub use oracle::{Conflict, MoveOracle, scale};
+pub use settle::{MoveKind, PartOutcome, SettleOptions, SettleReport};
 pub use warp::WarpField;

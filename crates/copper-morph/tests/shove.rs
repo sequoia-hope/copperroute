@@ -395,3 +395,59 @@ fn warping_keeps_every_connection_adds_no_violation_and_bends_copper() {
         "warping never moved copper; the test proves nothing"
     );
 }
+
+#[test]
+fn settle_moves_parts_toward_targets_on_a_routed_board_without_damage() {
+    let mut board = routed_board();
+    let oracle = MoveOracle {
+        guard: 0.0,
+        routable_copper_is_soft: false,
+    };
+    let per_mm = board
+        .communication
+        .get_resolution(copper_board::structure::Unit::Mm);
+    let ids: Vec<i32> = board
+        .components
+        .get_all()
+        .filter(|c| !c.position_fixed)
+        .map(|c| c.id)
+        .collect();
+    let directions = [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0), (0.7, 0.7)];
+    let targets: std::collections::BTreeMap<i32, IntVector> = ids
+        .iter()
+        .take(5)
+        .zip(directions)
+        .map(|(id, (dx, dy))| {
+            (
+                *id,
+                IntVector::new((0.3 * dx * per_mm) as i32, (0.3 * dy * per_mm) as i32),
+            )
+        })
+        .collect();
+    let before = violations(&mut board);
+    let open = unconnected(&mut board);
+    let options = copper_morph::SettleOptions {
+        step_mm: 0.1,
+        max_cycles: 10,
+        ..Default::default()
+    };
+    let report = oracle.settle(&mut board, &targets, &options);
+    for (id, outcome) in &report.parts {
+        eprintln!(
+            "part {id}: {:.0}/{:.0} arrived {} moves {:?}",
+            outcome.travelled, outcome.wanted, outcome.arrived, outcome.moves
+        );
+    }
+    let added: Vec<_> = violations(&mut board)
+        .difference(&before)
+        .cloned()
+        .collect();
+    assert!(added.is_empty(), "settle added {added:?}");
+    assert!(unconnected(&mut board) <= open, "settle lost a connection");
+    let travelled: f64 = report.parts.values().map(|o| o.travelled).sum();
+    assert!(travelled > 0.0, "nothing moved");
+    assert!(
+        report.parts.values().any(|o| o.arrived),
+        "no part reached its target"
+    );
+}
