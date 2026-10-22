@@ -1,15 +1,18 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use copper_board::board::StopConnectionOption;
 use copper_board::items::Item;
-use copper_board::{Board, ItemId};
-use copper_geometry::{IntVector, ShapeOps, Vector};
+use copper_board::{Board, DrcConstraints, ItemId};
+use copper_geometry::{IntVector, ShapeOps, TileShape, Vector};
 
 /// A component item and what it would collide with. An item paired with itself means it would
 /// leave the board.
 pub type Conflict = (ItemId, ItemId);
 
 const BISECTIONS: usize = 6;
+/// Margin given to a pair that can never be satisfied: leaving the board, or dragging fixed
+/// copper.
+const HOPELESS: f64 = -1.0e9;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MoveOracle {
@@ -20,23 +23,55 @@ pub struct MoveOracle {
 }
 
 impl MoveOracle {
+    /// Pairs closer than the referee allows if the component moved by `by`.
     pub fn conflicts(
         &self,
         board: &mut Board,
         component_id: i32,
         by: &IntVector,
     ) -> BTreeSet<Conflict> {
+        self.shortfalls(board, component_id, by)
+            .into_keys()
+            .collect()
+    }
+
+    /// Each pair short of its clearance, with its margin (gap minus required, negative).
+    ///
+    /// The required clearance is the stricter of the router's clearance matrix and the DRC's
+    /// rule, which judges a pad by its net class as KiCad does; the two differ on boards whose
+    /// pins carry a smaller item clearance class than their nets.
+    fn shortfalls(
+        &self,
+        board: &mut Board,
+        component_id: i32,
+        by: &IntVector,
+    ) -> BTreeMap<Conflict, f64> {
+        let constraints = copper_drc::constraints::resolve(board);
+        let reach = f64::from(
+            constraints
+                .netclass_clearance
+                .values()
+                .copied()
+                .chain(constraints.min_clearance)
+                .max()
+                .unwrap_or(0),
+        ) + self.guard;
+        let tolerance = f64::from(constraints.epsilon);
         let members: BTreeSet<ItemId> = board
             .get_component_items(component_id)
             .into_iter()
             .collect();
         let vector = Vector::Int(*by);
-        let mut found = BTreeSet::new();
+        let mut found: BTreeMap<Conflict, f64> = BTreeMap::new();
+        let mut note = |pair: Conflict, margin: f64| {
+            let entry = found.entry(pair).or_insert(margin);
+            *entry = entry.min(margin);
+        };
         if *by != IntVector::ZERO {
             for (pin, copper) in attached_copper(board, &members) {
-                let routable = board.get_item(copper).is_some_and(|c| c.is_routable());
+                let routable = board.get_item(copper).is_some_and(Item::is_routable);
                 if !(routable && self.routable_copper_is_soft) {
-                    found.insert((pin, copper));
+                    note((pin, copper), HOPELESS);
                 }
             }
         }
@@ -45,38 +80,36 @@ impl MoveOracle {
                 continue;
             };
             for (index, layer) in layers.into_iter().enumerate() {
-                let Some(shape) = board.item_tile_shape(id, index) else {
+                let Some(moved) = board
+                    .item_tile_shape(id, index)
+                    .map(|s| s.translate_by(&vector))
+                else {
                     continue;
                 };
-                let mut moved = shape.translate_by(&vector);
-                if self.guard > 0.0 {
-                    moved = moved.enlarge(self.guard);
-                }
-                if !moved.is_contained_in(&board.bounding_box) {
-                    found.insert((id, id));
+                if !moved
+                    .enlarge(self.guard)
+                    .is_contained_in(&board.bounding_box)
+                {
+                    note((id, id), HOPELESS);
                 }
                 let candidates = board.overlapping_items_with_clearance(
-                    &moved,
+                    &moved.enlarge(reach),
                     Some(layer),
                     &nets,
                     clearance_class,
                 );
-                let ctx = board.ctx();
-                let Some(item) = board.get_item(id) else {
-                    continue;
-                };
                 for other_id in candidates {
                     if members.contains(&other_id) {
                         continue;
                     }
-                    let Some(other) = board.get_item(other_id) else {
+                    let Some(required) =
+                        self.required_clearance(board, &constraints, id, other_id, layer)
+                    else {
                         continue;
                     };
-                    if self.routable_copper_is_soft && other.is_routable() {
-                        continue;
-                    }
-                    if other.is_obstacle(item, &ctx) {
-                        found.insert((id, other_id));
+                    let gap = shape_gap(board, &moved, other_id, layer, required);
+                    if gap < required - tolerance {
+                        note((id, other_id), gap - required);
                     }
                 }
             }
@@ -84,33 +117,66 @@ impl MoveOracle {
         found
     }
 
-    /// The largest fraction of `by` (full, else by bisection) whose conflicts are all
-    /// grandfathered, with the conflicts the full move would have added.
+    /// `None` when `other` does not constrain `id` at all.
+    fn required_clearance(
+        &self,
+        board: &Board,
+        constraints: &DrcConstraints,
+        id: ItemId,
+        other_id: ItemId,
+        layer: usize,
+    ) -> Option<f64> {
+        let item = board.get_item(id)?;
+        let other = board.get_item(other_id)?;
+        if self.routable_copper_is_soft && other.is_routable() {
+            return None;
+        }
+        if !other.is_obstacle(item, &board.ctx()) {
+            return None;
+        }
+        let matrix = board.rules.clearance_matrix.get_value(
+            item.clearance_class(),
+            other.clearance_class(),
+            layer,
+            false,
+        );
+        let drc =
+            copper_drc::constraints::pair_clearance(board, constraints, item, other).unwrap_or(0);
+        Some(f64::from(matrix.max(drc)) + self.guard)
+    }
+
+    /// The largest fraction of `by` (full, else by bisection) that creates no shortfall and lets
+    /// no grandfathered pair get closer (the settle engine's non-worsening rule), with the pairs
+    /// that fail at the smallest failing fraction found: those are what stops the move, while the
+    /// full move may have jumped clean past them.
     pub fn line_search(
         &self,
         board: &mut Board,
         component_id: i32,
         by: &IntVector,
     ) -> (f64, BTreeSet<Conflict>) {
-        let base = self.conflicts(board, component_id, &IntVector::ZERO);
-        let added = |oracle: &Self, board: &mut Board, fraction: f64| -> BTreeSet<Conflict> {
+        let base = self.shortfalls(board, component_id, &IntVector::ZERO);
+        let failing = |oracle: &Self, board: &mut Board, fraction: f64| -> BTreeSet<Conflict> {
             oracle
-                .conflicts(board, component_id, &scale(by, fraction))
-                .difference(&base)
-                .copied()
+                .shortfalls(board, component_id, &scale(by, fraction))
+                .into_iter()
+                .filter(|(pair, margin)| base.get(pair).is_none_or(|before| *margin < before - 1.0))
+                .map(|(pair, _)| pair)
                 .collect()
         };
-        let blockers = added(self, board, 1.0);
+        let mut blockers = failing(self, board, 1.0);
         if blockers.is_empty() {
             return (1.0, blockers);
         }
         let (mut lo, mut hi) = (0.0, 1.0);
         for _ in 0..BISECTIONS {
             let mid = (lo + hi) / 2.0;
-            if added(self, board, mid).is_empty() {
+            let at_mid = failing(self, board, mid);
+            if at_mid.is_empty() {
                 lo = mid;
             } else {
                 hi = mid;
+                blockers = at_mid;
             }
         }
         (lo, blockers)
@@ -130,7 +196,7 @@ impl MoveOracle {
             .collect();
         let attached = attached_copper(board, &members);
         if attached.iter().any(|(_, c)| {
-            !(self.routable_copper_is_soft && board.get_item(*c).is_some_and(|c| c.is_routable()))
+            !(self.routable_copper_is_soft && board.get_item(*c).is_some_and(Item::is_routable))
         }) {
             return false;
         }
@@ -138,16 +204,119 @@ impl MoveOracle {
         for (_, copper) in attached {
             ripped.extend(board.connection_items(copper, StopConnectionOption::None));
         }
-        ripped.retain(|id| board.get_item(*id).is_some_and(|item| item.is_routable()));
+        ripped.retain(|id| board.get_item(*id).is_some_and(Item::is_routable));
         board.remove_items(ripped);
+        // Pin shapes derive from the component's location, so it must move before the items are
+        // re-entered into the search trees.
+        board.components.move_component(component_id, &vector);
         for id in members {
             if !matches!(board.move_item_by(id, &vector), Ok(true)) {
                 return false;
             }
         }
-        board.components.move_component(component_id, &vector);
         true
     }
+
+    /// Moves the component as far toward `by` as admissible, first pushing aside other free
+    /// components that block it (each by its own line search, up to `depth` levels deep): the
+    /// settle engine's pressure, where a blocked mover deposits demand on its blockers. Returns
+    /// every move made, the requested component's last.
+    pub fn push(
+        &self,
+        board: &mut Board,
+        component_id: i32,
+        by: &IntVector,
+        depth: usize,
+    ) -> Vec<(i32, IntVector)> {
+        let mut moves = Vec::new();
+        self.push_into(
+            board,
+            component_id,
+            by,
+            depth,
+            &mut BTreeSet::from([component_id]),
+            &mut moves,
+        );
+        moves
+    }
+
+    fn push_into(
+        &self,
+        board: &mut Board,
+        component_id: i32,
+        by: &IntVector,
+        depth: usize,
+        busy: &mut BTreeSet<i32>,
+        moves: &mut Vec<(i32, IntVector)>,
+    ) {
+        let (fraction, blockers) = self.line_search(board, component_id, by);
+        if fraction < 1.0 && depth > 0 {
+            let mut pushed_any = false;
+            for blocker in blocking_components(board, &blockers) {
+                if busy.insert(blocker) {
+                    let before = moves.len();
+                    self.push_into(board, blocker, by, depth - 1, busy, moves);
+                    pushed_any |= moves.len() > before;
+                }
+            }
+            if pushed_any {
+                let (retry, _) = self.line_search(board, component_id, by);
+                self.commit(board, component_id, &scale(by, retry), moves);
+                return;
+            }
+        }
+        self.commit(board, component_id, &scale(by, fraction), moves);
+    }
+
+    fn commit(
+        &self,
+        board: &mut Board,
+        component_id: i32,
+        step: &IntVector,
+        moves: &mut Vec<(i32, IntVector)>,
+    ) {
+        if *step != IntVector::ZERO && self.translate(board, component_id, step) {
+            moves.push((component_id, *step));
+        }
+    }
+}
+
+/// The gap between `moved` and `other`'s shapes on `layer`, as the DRC measures it, up to `cap`.
+fn shape_gap(board: &mut Board, moved: &TileShape, other: ItemId, layer: usize, cap: f64) -> f64 {
+    let Some((_, _, layers)) = item_query_parameters(board, other) else {
+        return cap;
+    };
+    let mut gap = cap;
+    for (j, other_layer) in layers.into_iter().enumerate() {
+        if other_layer != layer {
+            continue;
+        }
+        if let Some(shape) = board.item_tile_shape(other, j) {
+            gap = gap.min(Board::calculate_clearance_between_two_shapes(
+                moved, &shape, cap, 0, 0,
+            ));
+        }
+    }
+    gap
+}
+
+/// Free components owning the obstacles in `blockers`.
+fn blocking_components(board: &Board, blockers: &BTreeSet<Conflict>) -> Vec<i32> {
+    let mut found = BTreeSet::new();
+    for (_, obstacle) in blockers {
+        let Some(component) = board.get_item(*obstacle).map(Item::component_id) else {
+            continue;
+        };
+        let free = component > 0
+            && board
+                .components
+                .get_all()
+                .any(|c| c.id == component && !c.position_fixed);
+        if free {
+            found.insert(component);
+        }
+    }
+    found.into_iter().collect()
 }
 
 pub fn scale(by: &IntVector, fraction: f64) -> IntVector {
@@ -157,7 +326,7 @@ pub fn scale(by: &IntVector, fraction: f64) -> IntVector {
     )
 }
 
-/// (component item, attached copper of another component or none) pairs.
+/// (component item, attached trace or via) pairs.
 fn attached_copper(board: &Board, members: &BTreeSet<ItemId>) -> Vec<(ItemId, ItemId)> {
     let mut attached = Vec::new();
     for &id in members {

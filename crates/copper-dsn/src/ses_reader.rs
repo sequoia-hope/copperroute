@@ -227,12 +227,13 @@ impl SesReader<'_> {
             return Ok(true);
         }
         let vector = Vector::Int(delta);
+        // Pin shapes derive from the component's location: move it before re-entering items.
+        self.board.components.move_component(id, &vector);
         for item in self.board.get_component_items(id) {
             if !matches!(self.board.move_item_by(item, &vector), Ok(true)) {
                 return Ok(false);
             }
         }
-        self.board.components.move_component(id, &vector);
         self.components_moved += 1;
         Ok(true)
     }

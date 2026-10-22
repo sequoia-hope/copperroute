@@ -145,6 +145,35 @@ fn the_drc_checker_agrees_no_violation_was_added() {
     }
     let after = pairs(&mut board);
     let added: Vec<_> = after.difference(&before).collect();
+    for (a, b, kind) in &added {
+        let detail = copper_drc::DesignRulesChecker::new(&mut board.clone())
+            .get_all_violations()
+            .into_iter()
+            .find(|v| v.first_item == *a && v.second_item == *b)
+            .map(|v| format!("{v:?}"))
+            .unwrap_or_default();
+        let describe = |id: copper_board::ItemId| {
+            let item = board.get_item(id).unwrap();
+            format!(
+                "{}#{} comp {} nets {:?} class {}",
+                format!("{item:?}").split('(').next().unwrap(),
+                id.0,
+                item.component_id(),
+                item.net_nos(),
+                item.clearance_class()
+            )
+        };
+        eprintln!(
+            "matrix clearance class 2/2 layer 0: {}",
+            board.rules.clearance_matrix.get_value(2, 2, 0, false)
+        );
+        eprintln!(
+            "ADDED {kind}: {} / {}\n  {}",
+            describe(*a),
+            b.map(describe).unwrap_or_default(),
+            &detail[..detail.len().min(500)]
+        );
+    }
     assert!(
         added.is_empty(),
         "{} new DRC violations after {moved} moves: {:?}",
@@ -207,6 +236,167 @@ fn a_nudged_placement_survives_a_session_round_trip() {
             again.get_location(),
             "{}",
             component.name
+        );
+    }
+}
+
+#[test]
+fn pushing_moves_further_than_a_plain_line_search_and_adds_no_violation() {
+    let mut board = read_board("Issue508-DAC2020_bm05.dsn");
+    let oracle = oracle();
+    let span = board.bounding_box.ur.x - board.bounding_box.ll.x;
+    let want = IntVector::new(span / 8, 0);
+    let pairs = |board: &mut Board| -> std::collections::BTreeSet<(
+        copper_board::ItemId,
+        Option<copper_board::ItemId>,
+        String,
+    )> {
+        copper_drc::DesignRulesChecker::new(board)
+            .get_all_violations()
+            .into_iter()
+            .map(|v| (v.first_item, v.second_item, format!("{:?}", v.kind)))
+            .collect()
+    };
+    let before = pairs(&mut board);
+    let mut gained = 0;
+    for id in movable_components(&board) {
+        let (plain, blockers) = oracle.line_search(&mut board.clone(), id, &want);
+        if plain >= 1.0 || blockers.is_empty() {
+            continue;
+        }
+        let mut trial = board.clone();
+        let moves = oracle.push(&mut trial, id, &want, 2);
+        let own = moves
+            .iter()
+            .rev()
+            .find(|(c, _)| *c == id)
+            .map_or(0, |(_, v)| v.x);
+        if f64::from(own) > plain * f64::from(want.x) + 1.0 && moves.len() > 1 {
+            gained += 1;
+            let added: Vec<_> = pairs(&mut trial).difference(&before).cloned().collect();
+            assert!(added.is_empty(), "pushing {id} added {added:?}");
+        }
+    }
+    assert!(
+        gained > 0,
+        "no push ever got further than the plain line search"
+    );
+}
+
+#[test]
+#[ignore = "diagnostic: who blocks whom"]
+fn print_blockers() {
+    let mut board = read_board("Issue508-DAC2020_bm05.dsn");
+    let oracle = oracle();
+    let span = board.bounding_box.ur.x - board.bounding_box.ll.x;
+    let want = IntVector::new(span / 8, 0);
+    for id in movable_components(&board).into_iter().take(20) {
+        let (plain, blockers) = oracle.line_search(&mut board.clone(), id, &want);
+        let kinds: Vec<String> = blockers
+            .iter()
+            .map(|(_, o)| {
+                let item = board.get_item(*o).unwrap();
+                let c = item.component_id();
+                let kind = format!("{item:?}").split('(').next().unwrap().to_string();
+                let movable = oracle.line_search(&mut board.clone(), c.max(1), &want).0;
+                format!("{kind}@c{c}(fr{movable:.2})")
+            })
+            .collect();
+        let mut trial = board.clone();
+        let moves = oracle.push(&mut trial, id, &want, 2);
+        println!("c{id}: plain {plain:.2}; blockers {kinds:?}; push moves {moves:?}");
+    }
+}
+
+#[test]
+#[ignore = "diagnostic: step through one push"]
+fn print_one_push() {
+    let mut board = read_board("Issue508-DAC2020_bm05.dsn");
+    let oracle = oracle();
+    let span = board.bounding_box.ur.x - board.bounding_box.ll.x;
+    let want = IntVector::new(span / 8, 0);
+    let (f, b) = oracle.line_search(&mut board, 4, &want);
+    let describe =
+        |board: &Board,
+         b: &std::collections::BTreeSet<(copper_board::ItemId, copper_board::ItemId)>|
+         -> Vec<String> {
+            b.iter()
+                .map(|(m, o)| {
+                    let mi = board.get_item(*m).unwrap();
+                    let oi = board.get_item(*o).unwrap();
+                    format!(
+                        "{}c{} vs {}c{}",
+                        format!("{mi:?}").split('(').next().unwrap(),
+                        mi.component_id(),
+                        format!("{oi:?}").split('(').next().unwrap(),
+                        oi.component_id()
+                    )
+                })
+                .collect()
+        };
+    println!(
+        "before: fraction {f:.3} blockers {:?}",
+        describe(&board, &b)
+    );
+    let loc = |board: &Board, c: i32| {
+        board
+            .components
+            .get_all()
+            .find(|x| x.id == c)
+            .unwrap()
+            .get_location()
+            .cloned()
+    };
+    println!("c26 at {:?}", loc(&board, 26));
+    let (f26, _) = oracle.line_search(&mut board, 26, &want);
+    println!(
+        "c26 line search {f26:.3}; translate ok {}",
+        oracle.translate(&mut board, 26, &scale(&want, f26))
+    );
+    println!("c26 now at {:?}", loc(&board, 26));
+    let (f, b) = oracle.line_search(&mut board, 4, &want);
+    println!("after: fraction {f:.3} blockers {:?}", describe(&board, &b));
+}
+
+#[test]
+fn every_item_shape_moves_by_exactly_the_vector() {
+    let mut board = read_board("Issue508-DAC2020_bm05.dsn");
+    let oracle = oracle();
+    let by = IntVector::new(12_345, -6_789);
+    for id in movable_components(&board).into_iter().take(8) {
+        let items = board.get_component_items(id);
+        let boxes = |board: &mut Board| -> Vec<copper_geometry::IntBox> {
+            let mut out = Vec::new();
+            for &item in &items {
+                let ctx = board.ctx();
+                let count = board.get_item(item).unwrap().tile_shape_count(&ctx);
+                for i in 0..count {
+                    out.push(board.item_tile_shape(item, i).unwrap().bounding_box());
+                }
+            }
+            out
+        };
+        let before = boxes(&mut board);
+        assert!(oracle.translate(&mut board, id, &by));
+        let after = boxes(&mut board);
+        assert!(!before.is_empty());
+        for (b, a) in before.iter().zip(&after) {
+            assert_eq!(
+                (
+                    a.ll.x - b.ll.x,
+                    a.ll.y - b.ll.y,
+                    a.ur.x - b.ur.x,
+                    a.ur.y - b.ur.y
+                ),
+                (by.x, by.y, by.x, by.y),
+                "component {id}"
+            );
+        }
+        let probe = board.item_tile_shape(items[0], 0).unwrap();
+        let hits = board.overlapping_items_with_clearance(&probe, None, &[], 0);
+        assert!(
+            hits.contains(&items[0]),
+            "the search tree finds component {id}'s item where it now is"
         );
     }
 }
