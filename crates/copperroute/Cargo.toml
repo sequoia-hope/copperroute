@@ -20,6 +20,7 @@ copper-dsn = { path = "../copper-dsn" }
 copper-board = { path = "../copper-board" }
 copper-drc = { path = "../copper-drc" }
 copper-router = { path = "../copper-router" }
+copper-governor = { path = "../copper-governor" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

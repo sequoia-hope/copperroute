@@ -34,6 +34,7 @@ pub fn run(
         cancel: cancel.clone(),
         progress: progress_sink(progress),
         visualize: None,
+        memory_ceiling: state.memory_ceiling,
     })
     .map_err(super::rpc_error)?;
     outcome.job.id = super::mint_job_id();

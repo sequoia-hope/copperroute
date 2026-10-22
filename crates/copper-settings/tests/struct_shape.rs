@@ -305,9 +305,9 @@ fn field_names_pin_javas_declaration_order() {
 }
 
 #[test]
-fn host_environment_default_max_threads_matches_java_formula() {
+fn host_environment_default_max_threads_leaves_half_the_host_free() {
     assert_eq!(HostEnvironment::with_processors(1).default_max_threads(), 1);
-    assert_eq!(HostEnvironment::with_processors(8).default_max_threads(), 7);
+    assert_eq!(HostEnvironment::with_processors(8).default_max_threads(), 4);
     assert_eq!(HostEnvironment::with_processors(0).default_max_threads(), 1);
 }
 

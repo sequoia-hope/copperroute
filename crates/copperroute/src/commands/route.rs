@@ -7,7 +7,7 @@ use crate::cli::{Cli, RouteArgs};
 use crate::ops::load::{BoardSource, LoadRequest};
 use crate::ops::route::{OutputTarget, RouteOutcome, RouteRequest, route};
 
-pub fn run(cli: &Cli, args: &RouteArgs) -> ExitCode {
+pub fn run(cli: &Cli, args: &RouteArgs, memory_ceiling: Option<u64>) -> ExitCode {
     let mut set = args.set.clone();
     if let Some(passes) = args.max_passes {
         set.push(format!("router.max_passes={passes}"));
@@ -38,6 +38,7 @@ pub fn run(cli: &Cli, args: &RouteArgs) -> ExitCode {
         cancel: copper_core::CancelToken::new(),
         progress: SyncProgressSink::noop(),
         visualize,
+        memory_ceiling,
     }) {
         Ok(outcome) => outcome,
         Err(error) => {

@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use copper_governor::{MemoryGuard, MemoryPressure};
 
 use copper_core::{
     BoardFileDetails, CancelToken, Ctx, FileFormat, JobStopReason, RouterBudget, RoutingJob,
@@ -54,6 +56,7 @@ pub struct RouteRequest {
     pub cancel: CancelToken,
     pub progress: SyncProgressSink,
     pub visualize: Option<RoutingVisualizationOptions>,
+    pub memory_ceiling: Option<u64>,
 }
 
 pub struct RouteOutcome {
@@ -91,7 +94,7 @@ pub fn route(request: RouteRequest) -> Result<RouteOutcome, OpError> {
         mut board,
         transform,
         settings,
-        warnings,
+        mut warnings,
         ..
     } = load(&request.load)?;
 
@@ -123,7 +126,13 @@ pub fn route(request: RouteRequest) -> Result<RouteOutcome, OpError> {
         progress: &request.progress,
         budget: budget_for(&settings),
     };
+    let guard = request
+        .memory_ceiling
+        .map(|ceiling| memory_guard(ceiling, &ctx.cancel));
     let result = RoutingPipeline::run(&mut board, &ctx)?;
+    if let Some(warning) = guard.and_then(|guard| memory_warning(&guard)) {
+        warnings.push(warning);
+    }
     let visualization = visualization.map(copper_router::RoutingVisualizationGuard::finish);
 
     job.finished_at = Some(Instant::now());
@@ -155,6 +164,31 @@ pub fn route(request: RouteRequest) -> Result<RouteOutcome, OpError> {
         visualization,
         warnings,
     })
+}
+
+fn memory_guard(ceiling: u64, cancel: &CancelToken) -> MemoryGuard {
+    let (soft, hard) = (cancel.clone(), cancel.clone());
+    MemoryGuard::spawn(
+        ceiling,
+        Duration::from_millis(200),
+        copper_governor::rss_bytes,
+        move |_| soft.cancel_auto_router(),
+        move |_| hard.cancel(),
+    )
+}
+
+fn memory_warning(guard: &MemoryGuard) -> Option<String> {
+    let peak = guard.peak_bytes() >> 20;
+    match guard.pressure() {
+        MemoryPressure::None => None,
+        MemoryPressure::Soft => Some(format!(
+            "routing stopped early at the memory ceiling (peak {peak} MiB); the session holds \
+             what was routed so far"
+        )),
+        MemoryPressure::Hard => Some(format!(
+            "the job was cancelled past the hard memory ceiling (peak {peak} MiB)"
+        )),
+    }
 }
 
 fn attach_output(job: &mut RoutingJob, session: &[u8], format: OutputFormat) {

@@ -85,6 +85,7 @@ pub struct State {
     tools: BTreeMap<String, (ToolDef, ToolHandler)>,
     pub initialized: AtomicBool,
     pub overrides: crate::ops::SettingsOverrides,
+    pub memory_ceiling: Option<u64>,
 }
 
 impl Default for State {
@@ -99,6 +100,7 @@ impl State {
             tools: BTreeMap::new(),
             initialized: AtomicBool::new(false),
             overrides: crate::ops::SettingsOverrides::default(),
+            memory_ceiling: None,
         }
     }
 

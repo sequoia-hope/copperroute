@@ -27,6 +27,7 @@ fn request(dsn: PathBuf, output: OutputTarget, set: Vec<String>) -> RouteRequest
         cancel: copper_core::CancelToken::new(),
         progress: copper_core::SyncProgressSink::noop(),
         visualize: None,
+        memory_ceiling: None,
     }
 }
 

@@ -27,7 +27,7 @@ impl HostEnvironment {
         if self.available_processors == 0 {
             return 1;
         }
-        std::cmp::max(1, self.available_processors as i32 - 1)
+        std::cmp::max(1, self.available_processors as i32 / 2)
     }
 }
 
@@ -36,9 +36,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_max_threads_matches_java_formula() {
+    fn default_max_threads_leaves_half_the_host_free() {
         assert_eq!(HostEnvironment::with_processors(1).default_max_threads(), 1);
-        assert_eq!(HostEnvironment::with_processors(8).default_max_threads(), 7);
+        assert_eq!(HostEnvironment::with_processors(8).default_max_threads(), 4);
+        assert_eq!(
+            HostEnvironment::with_processors(24).default_max_threads(),
+            12
+        );
         assert_eq!(HostEnvironment::with_processors(0).default_max_threads(), 1);
     }
 

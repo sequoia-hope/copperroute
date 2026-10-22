@@ -41,12 +41,18 @@ pub fn run(raw: &[String]) -> ExitCode {
     logging::init(logging::level_for(cli.verbose, cli.log_level.as_deref()));
 
     match &cli.command {
-        cli::Command::Route(args) => commands::route::run(&cli, args),
+        cli::Command::Route(args) => match commands::govern(&cli) {
+            Ok(ceiling) => commands::route::run(&cli, args, ceiling),
+            Err(code) => code,
+        },
         cli::Command::Drc(args) => commands::drc::run(&cli, args),
         cli::Command::Info(args) => commands::info::run(&cli, args),
-        cli::Command::Mcp => match mcp::stdio::run(commands::overrides(&cli, &[])) {
-            0 => ExitCode::Ok,
-            _ => ExitCode::Failure,
+        cli::Command::Mcp => match commands::govern(&cli) {
+            Ok(ceiling) => match mcp::stdio::run(commands::overrides(&cli, &[]), ceiling) {
+                0 => ExitCode::Ok,
+                _ => ExitCode::Failure,
+            },
+            Err(code) => code,
         },
     }
 }

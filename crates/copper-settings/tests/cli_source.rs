@@ -292,7 +292,7 @@ fn mt_feeds_two_fields_with_different_clamps() {
     ])
     .merge(&host());
     assert_eq!(merged.max_threads, Some(4));
-    assert_eq!(merged.optimizer.as_ref().unwrap().max_threads, Some(3));
+    assert_eq!(merged.optimizer.as_ref().unwrap().max_threads, Some(2));
 }
 
 #[test]

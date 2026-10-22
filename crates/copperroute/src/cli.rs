@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::ops::route::OutputFormat;
+use copper_governor::MemoryCeiling;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -20,6 +21,14 @@ pub struct Cli {
     /// A settings JSON, applied below the design's own settings and below --set.
     #[arg(long, global = true, value_name = "FILE")]
     pub settings: Option<PathBuf>,
+    /// Scheduling niceness for route and mcp, 0..=19. Defaults to $COPPERROUTE_NICE, else 10.
+    #[arg(long, global = true)]
+    pub nice: Option<i32>,
+    /// Stop routing once resident memory reaches this size (512M, 4G), keeping what is routed.
+    /// `auto` is half the memory available at start; `off` disables the ceiling. Defaults to
+    /// $COPPERROUTE_MAX_MEMORY, else auto.
+    #[arg(long, global = true, value_parser = MemoryCeiling::parse)]
+    pub max_memory: Option<MemoryCeiling>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -237,6 +246,27 @@ mod tests {
             Cli::try_parse_from(["copperroute", "mcp"]).unwrap().command,
             Command::Mcp
         ));
+    }
+
+    #[test]
+    fn governance_flags_are_global() {
+        let cli = Cli::try_parse_from([
+            "copperroute",
+            "route",
+            "a.dsn",
+            "-o",
+            "b.ses",
+            "--nice",
+            "15",
+            "--max-memory",
+            "2G",
+        ])
+        .unwrap();
+        assert_eq!(cli.nice, Some(15));
+        assert_eq!(cli.max_memory, Some(MemoryCeiling::Bytes(2 << 30)));
+        let cli = Cli::try_parse_from(["copperroute", "--max-memory", "off", "mcp"]).unwrap();
+        assert_eq!(cli.max_memory, Some(MemoryCeiling::Off));
+        assert!(Cli::try_parse_from(["copperroute", "--max-memory", "lots", "mcp"]).is_err());
     }
 
     #[test]

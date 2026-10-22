@@ -8,8 +8,9 @@ use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-pub fn run(overrides: crate::ops::SettingsOverrides) -> i32 {
+pub fn run(overrides: crate::ops::SettingsOverrides, memory_ceiling: Option<u64>) -> i32 {
     let mut state = State::with_overrides(overrides);
+    state.memory_ceiling = memory_ceiling;
     super::tools::register_all(&mut state);
     run_with(
         state,
