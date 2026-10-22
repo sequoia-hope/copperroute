@@ -320,6 +320,7 @@ dependencies = [
  "copper-drc",
  "copper-dsn",
  "copper-geometry",
+ "copper-router",
  "testkit",
 ]
 

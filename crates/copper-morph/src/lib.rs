@@ -6,5 +6,6 @@
 //! grandfathered, so a board that is not DRC-clean can still be nudged without being made worse.
 
 mod oracle;
+mod shove;
 
 pub use oracle::{Conflict, MoveOracle, scale};

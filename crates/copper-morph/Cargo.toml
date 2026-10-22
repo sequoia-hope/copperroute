@@ -8,6 +8,7 @@ license.workspace = true
 copper-board = { path = "../copper-board" }
 copper-drc = { path = "../copper-drc" }
 copper-geometry = { path = "../copper-geometry" }
+copper-router = { path = "../copper-router" }
 
 [dev-dependencies]
 copper-dsn = { path = "../copper-dsn" }
