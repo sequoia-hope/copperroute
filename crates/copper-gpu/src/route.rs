@@ -1,0 +1,236 @@
+//! Sequential grid routing: each open connection is routed on a fresh conservative grid of its
+//! net, with everything already on the board as obstacles, and committed as traces and vias.
+
+use std::collections::BTreeSet;
+
+use copper_board::items::Item;
+use copper_board::{Board, FixedState, ItemId};
+use copper_geometry::{FloatPoint, IntPoint, Point, Polyline};
+
+use crate::grid::RouteGrid;
+use crate::search::{GridPath, cost_field, trace_back};
+
+/// Computes the cost field for a grid; the CPU reference or the GPU kernel.
+pub trait FieldSolver {
+    fn solve(&mut self, grid: &RouteGrid, sources: &[usize], via_cost: u32) -> Vec<u32>;
+}
+
+pub struct CpuSolver;
+
+impl FieldSolver for CpuSolver {
+    fn solve(&mut self, grid: &RouteGrid, sources: &[usize], via_cost: u32) -> Vec<u32> {
+        cost_field(grid, sources, via_cost)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GridOptions {
+    /// Cell size, in board units.
+    pub cell: f64,
+    pub via_cost: u32,
+    /// Connections to attempt before giving up, so a board that cannot close does not spin.
+    pub max_attempts: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GridStats {
+    pub routed: usize,
+    pub failed: usize,
+    pub vias: usize,
+}
+
+pub fn route_open_connections(
+    board: &mut Board,
+    solver: &mut dyn FieldSolver,
+    options: &GridOptions,
+    stop: &dyn Fn() -> bool,
+) -> GridStats {
+    let mut stats = GridStats::default();
+    let mut given_up: BTreeSet<(ItemId, Option<ItemId>)> = BTreeSet::new();
+    for _ in 0..options.max_attempts {
+        if stop() {
+            break;
+        }
+        let gaps = copper_drc::DesignRulesChecker::new(board).get_all_unconnected_items();
+        let Some(gap) = gaps.into_iter().find(|g| {
+            g.second_item.is_some() && !given_up.contains(&(g.first_item, g.second_item))
+        }) else {
+            break;
+        };
+        let (from, to) = (gap.first_item, gap.second_item.expect("filtered"));
+        let Some(net) = board
+            .get_item(from)
+            .and_then(|i| i.net_nos().first().copied())
+        else {
+            given_up.insert((from, Some(to)));
+            continue;
+        };
+        let grid = RouteGrid::build(board, net, options.cell);
+        let sources = terminal_cells(board, &grid, from);
+        let targets = terminal_cells(board, &grid, to);
+        let cost = solver.solve(&grid, &sources, options.via_cost);
+        match trace_back(&grid, &cost, &targets, options.via_cost) {
+            Some(path) => {
+                stats.vias += commit(board, &grid, &path, from, to);
+                stats.routed += 1;
+            }
+            None => {
+                stats.failed += 1;
+                given_up.insert((from, Some(to)));
+            }
+        }
+    }
+    stats
+}
+
+/// Free cells whose centre lies on the item, on the grid's routing layers.
+pub fn terminal_cells(board: &mut Board, grid: &RouteGrid, item: ItemId) -> Vec<usize> {
+    let layers: Vec<usize> = {
+        let ctx = board.ctx();
+        let Some(it) = board.get_item(item) else {
+            return Vec::new();
+        };
+        (0..it.tile_shape_count(&ctx))
+            .map(|i| it.shape_layer(i, &ctx))
+            .collect()
+    };
+    let ends: Vec<FloatPoint> = match board.get_item(item) {
+        Some(Item::Trace(trace)) => [trace.first_corner(), trace.last_corner()]
+            .into_iter()
+            .flatten()
+            .map(|p| p.to_float())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut cells = Vec::new();
+    for (index, layer) in layers.into_iter().enumerate() {
+        let Some(routing_layer) = grid.layers.iter().position(|&l| l == layer) else {
+            continue;
+        };
+        let Some(shape) = board.item_tile_shape(item, index) else {
+            continue;
+        };
+        let bb = copper_geometry::ShapeOps::bounding_box(&shape);
+        let lo_i = ((f64::from(bb.ll.x) - grid.x0) / grid.h).floor().max(0.0) as usize;
+        let lo_j = ((f64::from(bb.ll.y) - grid.y0) / grid.h).floor().max(0.0) as usize;
+        let hi_i = (((f64::from(bb.ur.x) - grid.x0) / grid.h).ceil() as usize).min(grid.nx - 1);
+        let hi_j = (((f64::from(bb.ur.y) - grid.y0) / grid.h).ceil() as usize).min(grid.ny - 1);
+        for j in lo_j..=hi_j {
+            for i in lo_i..=hi_i {
+                let index = grid.index(routing_layer, i, j);
+                let centre = grid.centre(i, j);
+                let on_item = shape.distance(&centre) == 0.0;
+                let near_end = ends.is_empty()
+                    || ends
+                        .iter()
+                        .any(|e| (e.x - centre.x).hypot(e.y - centre.y) <= grid.h);
+                if !grid.blocked[index] && on_item && near_end {
+                    cells.push(index);
+                }
+            }
+        }
+    }
+    cells
+}
+
+/// The exact point a trace must end on to contact `item`: a drill item's centre, or the end
+/// corner of a trace nearest `near` (the board's contact rule).
+fn anchor(board: &Board, item: ItemId, near: &FloatPoint) -> Option<Point> {
+    match board.get_item(item)? {
+        Item::Pin(_) | Item::Via(_) => board.drill_center(item),
+        Item::Trace(trace) => [trace.first_corner(), trace.last_corner()]
+            .into_iter()
+            .flatten()
+            .min_by(|a, b| {
+                let (a, b) = (a.to_float(), b.to_float());
+                (a.x - near.x)
+                    .hypot(a.y - near.y)
+                    .total_cmp(&(b.x - near.x).hypot(b.y - near.y))
+            }),
+        _ => None,
+    }
+}
+
+/// Inserts the path as traces (collinear runs merged) and vias, its ends extended to the
+/// terminals' anchors; returns the vias inserted.
+fn commit(board: &mut Board, grid: &RouteGrid, path: &GridPath, from: ItemId, to: ItemId) -> usize {
+    let point = |&(_, i, j): &(usize, usize, usize)| {
+        let c = grid.centre(i, j);
+        Point::Int(IntPoint::new(c.x.round() as i32, c.y.round() as i32))
+    };
+    let mut runs: Vec<(usize, Vec<Point>)> = Vec::new();
+    let mut vias = Vec::new();
+    let mut run: Vec<(usize, usize, usize)> = Vec::new();
+    let mut close = |run: &[(usize, usize, usize)], runs: &mut Vec<(usize, Vec<Point>)>| {
+        let mut points = vec![point(&run[0])];
+        for k in 1..run.len().saturating_sub(1) {
+            let (a, b, c) = (run[k - 1], run[k], run[k + 1]);
+            let turn = (b.1 as i64 - a.1 as i64, b.2 as i64 - a.2 as i64)
+                != (c.1 as i64 - b.1 as i64, c.2 as i64 - b.2 as i64);
+            if turn {
+                points.push(point(&b));
+            }
+        }
+        if run.len() > 1 {
+            points.push(point(&run[run.len() - 1]));
+        }
+        runs.push((run[0].0, points));
+    };
+    for step in path {
+        if let Some(last) = run.last().copied() {
+            if last.0 != step.0 {
+                close(&run, &mut runs);
+                vias.push(point(step));
+                run.clear();
+            }
+        }
+        run.push(*step);
+    }
+    close(&run, &mut runs);
+
+    if let (Some(first), Some(start)) = (runs.first_mut(), path.first()) {
+        if let Some(a) = anchor(board, from, &grid.centre(start.1, start.2)) {
+            if first.1.first() != Some(&a) {
+                first.1.insert(0, a);
+            }
+        }
+    }
+    if let (Some(last), Some(end)) = (runs.last_mut(), path.last()) {
+        if let Some(a) = anchor(board, to, &grid.centre(end.1, end.2)) {
+            if last.1.last() != Some(&a) {
+                last.1.push(a);
+            }
+        }
+    }
+    for (layer, points) in runs {
+        if points.len() >= 2 {
+            board.insert_trace(
+                Polyline::from_points(&points),
+                grid.layers[layer],
+                grid.half_width,
+                vec![grid.net],
+                grid.trace_clearance_class,
+                FixedState::Unfixed,
+            );
+        }
+    }
+    let mut inserted = 0;
+    if let Some(via) = &grid.via {
+        for at in vias {
+            if board
+                .insert_via(
+                    via.padstack,
+                    at,
+                    vec![grid.net],
+                    via.clearance_class,
+                    FixedState::Unfixed,
+                    false,
+                )
+                .is_ok()
+            {
+                inserted += 1;
+            }
+        }
+    }
+    inserted
+}

@@ -1,1 +1,10 @@
+#![forbid(unsafe_code)]
+//! Grid routing whose search can run on the GPU: a conservative per-net grid, a cost field from
+//! the sources (CPU reference or GPU kernel), and a walk back down it.
 
+pub mod grid;
+pub mod route;
+pub mod search;
+
+pub use grid::RouteGrid;
+pub use route::{CpuSolver, FieldSolver, GridOptions, GridStats, route_open_connections};

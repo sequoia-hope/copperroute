@@ -5,5 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+copper-board = { path = "../copper-board" }
+copper-drc = { path = "../copper-drc" }
+copper-geometry = { path = "../copper-geometry" }
 wgpu = "30"
 pollster = "0.4"
+
+[dev-dependencies]
+copper-dsn = { path = "../copper-dsn" }
+testkit = { path = "../../tests/testkit" }

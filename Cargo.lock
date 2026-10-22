@@ -308,7 +308,12 @@ dependencies = [
 name = "copper-gpu"
 version = "0.1.0"
 dependencies = [
+ "copper-board",
+ "copper-drc",
+ "copper-dsn",
+ "copper-geometry",
  "pollster",
+ "testkit",
  "wgpu",
 ]
 
