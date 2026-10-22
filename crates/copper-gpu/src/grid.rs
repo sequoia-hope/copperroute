@@ -13,7 +13,7 @@ use copper_geometry::{FloatPoint, IntBox, ShapeOps};
 /// of the cell size: half the diagonal.
 const STEP_REACH: f64 = std::f64::consts::FRAC_1_SQRT_2;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ViaChoice {
     pub padstack: PadstackId,
     pub clearance_class: usize,
@@ -49,76 +49,164 @@ impl RouteGrid {
     }
 
     pub fn centre(&self, i: usize, j: usize) -> FloatPoint {
-        FloatPoint::new(self.x0 + (i as f64 + 0.5) * self.h, self.y0 + (j as f64 + 0.5) * self.h)
+        FloatPoint::new(
+            self.x0 + (i as f64 + 0.5) * self.h,
+            self.y0 + (j as f64 + 0.5) * self.h,
+        )
     }
 
     pub fn build(board: &mut Board, net: i32, h: f64) -> RouteGrid {
+        let profile = GridProfile::for_net(board, net);
+        let mut map = ObstacleMap::new(board, profile, h);
+        let ids: Vec<ItemId> = board.get_items().map(Item::id).collect();
+        map.stamp(board, &ids);
+        RouteGrid::view(&map, net)
+    }
+
+    /// The grid a net sees in a shared obstacle map: a cell is blocked unless nothing claims it
+    /// or only this net does.
+    pub fn view(map: &ObstacleMap, net: i32) -> RouteGrid {
+        let free = |owner: i32| owner == FREE || owner == net;
+        RouteGrid {
+            net,
+            x0: map.x0,
+            y0: map.y0,
+            h: map.h,
+            nx: map.nx,
+            ny: map.ny,
+            layers: map.profile.layers.clone(),
+            half_width: map.profile.half_width,
+            trace_clearance_class: map.profile.trace_clearance_class,
+            via: map.profile.via.clone(),
+            blocked: map.owner.iter().map(|&o| !free(o)).collect(),
+            via_blocked: map.via_owner.iter().map(|&o| !free(o)).collect(),
+        }
+    }
+}
+
+const FREE: i32 = 0;
+const SEVERAL: i32 = -1;
+
+/// What a grid depends on besides the board: the routing net's class.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GridProfile {
+    pub layers: Vec<usize>,
+    pub half_width: i32,
+    pub trace_clearance_class: usize,
+    /// The DRC clearance of the routing net's class.
+    pub own_rule: i32,
+    pub via: Option<ViaChoice>,
+}
+
+impl GridProfile {
+    pub fn for_net(board: &Board, net: i32) -> GridProfile {
+        let net_class = board
+            .rules
+            .nets
+            .get(net)
+            .map(|n| board.rules.net_classes.get(n.net_class).clone());
+        let layers: Vec<usize> = (0..board.get_layer_count())
+            .filter(|&l| board.layer_structure().layers[l].is_signal)
+            .filter(|&l| {
+                net_class
+                    .as_ref()
+                    .is_none_or(|c| c.is_active_routing_layer(l))
+            })
+            .collect();
+        let half_width = layers
+            .first()
+            .map_or(0, |&l| board.rules.get_trace_half_width(net, l));
+        let constraints = resolve(board);
+        let own_rule = netclass_name(board, net)
+            .and_then(|name| constraints.netclass_clearance.get(&name).copied())
+            .unwrap_or(0);
+        let via = net_class
+            .as_ref()
+            .and_then(|c| c.get_via_rule())
+            .and_then(|rule| {
+                rule.iter().next().map(|info| ViaChoice {
+                    padstack: info.get_padstack(),
+                    clearance_class: info.get_clearance_class_index(),
+                    radius: board
+                        .library
+                        .padstacks
+                        .get(info.get_padstack())
+                        .map_or(0.0, padstack_radius),
+                })
+            });
+        GridProfile {
+            layers,
+            half_width,
+            trace_clearance_class: net_class
+                .as_ref()
+                .map_or(0, |c| c.get_trace_clearance_class()),
+            own_rule,
+            via,
+        }
+    }
+}
+
+/// Who blocks each cell for a profile: nobody, one net (which may still use it), or several
+/// nets or a netless obstacle. Built once, then stamped with each item added to the board.
+#[derive(Debug, Clone)]
+pub struct ObstacleMap {
+    pub profile: GridProfile,
+    x0: f64,
+    y0: f64,
+    h: f64,
+    nx: usize,
+    ny: usize,
+    owner: Vec<i32>,
+    via_owner: Vec<i32>,
+}
+
+impl ObstacleMap {
+    pub fn new(board: &Board, profile: GridProfile, h: f64) -> ObstacleMap {
         let bounds = board.bounding_box;
         let x0 = f64::from(bounds.ll.x);
         let y0 = f64::from(bounds.ll.y);
         let nx = ((f64::from(bounds.ur.x) - x0) / h).floor().max(1.0) as usize;
         let ny = ((f64::from(bounds.ur.y) - y0) / h).floor().max(1.0) as usize;
-
-        let class_index = board.rules.nets.get(net).map(|n| n.net_class);
-        let net_class = class_index.map(|c| board.rules.net_classes.get(c).clone());
-        let layers: Vec<usize> = (0..board.get_layer_count())
-            .filter(|&l| board.layer_structure().layers[l].is_signal)
-            .filter(|&l| net_class.as_ref().is_none_or(|c| c.is_active_routing_layer(l)))
-            .collect();
-        let half_width = layers.first().map_or(0, |&l| board.rules.get_trace_half_width(net, l));
-        let trace_clearance_class = net_class.as_ref().map_or(0, |c| c.get_trace_clearance_class());
-        let via = net_class.as_ref().and_then(|c| c.get_via_rule()).and_then(|rule| {
-            rule.iter().next().map(|info| ViaChoice {
-                padstack: info.get_padstack(),
-                clearance_class: info.get_clearance_class_index(),
-                radius: board
-                    .library
-                    .padstacks
-                    .get(info.get_padstack())
-                    .map_or(0.0, padstack_radius),
-            })
-        });
-
-        let mut grid = RouteGrid {
-            net,
+        let layers = profile.layers.len();
+        ObstacleMap {
+            profile,
             x0,
             y0,
             h,
             nx,
             ny,
-            half_width,
-            trace_clearance_class,
-            via,
-            blocked: vec![false; layers.len() * nx * ny],
-            via_blocked: vec![false; nx * ny],
-            layers,
-        };
-        grid.rasterize_obstacles(board);
-        grid
+            owner: vec![FREE; layers * nx * ny],
+            via_owner: vec![FREE; nx * ny],
+        }
     }
 
-    fn rasterize_obstacles(&mut self, board: &mut Board) {
+    /// Stamps `items` into the map.
+    pub fn stamp(&mut self, board: &mut Board, items: &[ItemId]) {
         let constraints = resolve(board);
-        let own_rule = netclass_name(board, self.net)
-            .and_then(|name| constraints.netclass_clearance.get(&name).copied())
-            .unwrap_or(0);
-        let ids: Vec<ItemId> = board.get_items().map(Item::id).collect();
-        for id in ids {
-            let (blocks_traces, blocks_vias, class, other_rule) = {
+        for &id in items {
+            let (blocks_traces, blocks_vias, class, owner, other_rule) = {
                 let Some(item) = board.get_item(id) else {
                     continue;
                 };
-                if item.contains_net(self.net) {
-                    continue;
-                }
-                let blocks_traces = item.is_trace_obstacle(self.net);
+                let blocks_traces = item.is_trace_obstacle(i32::MIN);
                 let blocks_vias = blocks_traces || matches!(item, Item::ViaObstacleArea(_));
+                let owner = match item.net_count() {
+                    0 => SEVERAL,
+                    1 => item.get_net_number(0),
+                    _ => SEVERAL,
+                };
                 let other_rule = (item.net_count() > 0)
                     .then(|| netclass_name(board, item.get_net_number(0)))
                     .flatten()
                     .and_then(|name| constraints.netclass_clearance.get(&name).copied())
                     .unwrap_or(0);
-                (blocks_traces, blocks_vias, item.clearance_class(), other_rule)
+                (
+                    blocks_traces,
+                    blocks_vias,
+                    item.clearance_class(),
+                    owner,
+                    other_rule,
+                )
             };
             if !blocks_traces && !blocks_vias {
                 continue;
@@ -126,50 +214,83 @@ impl RouteGrid {
             let shape_layers: Vec<usize> = {
                 let ctx = board.ctx();
                 let item = board.get_item(id).expect("present");
-                (0..item.tile_shape_count(&ctx)).map(|i| item.shape_layer(i, &ctx)).collect()
+                (0..item.tile_shape_count(&ctx))
+                    .map(|i| item.shape_layer(i, &ctx))
+                    .collect()
             };
             for (index, layer) in shape_layers.into_iter().enumerate() {
                 let Some(shape) = board.item_tile_shape(id, index) else {
                     continue;
                 };
+                let own_rule = self.profile.own_rule;
                 let rule = |own_class: usize| {
-                    let matrix = board.rules.clearance_matrix.get_value(own_class, class, layer, false);
-                    f64::from(matrix.max(own_rule).max(other_rule).max(constraints.min_clearance.unwrap_or(0)))
+                    let matrix = board
+                        .rules
+                        .clearance_matrix
+                        .get_value(own_class, class, layer, false);
+                    f64::from(
+                        matrix
+                            .max(own_rule)
+                            .max(other_rule)
+                            .max(constraints.min_clearance.unwrap_or(0)),
+                    )
                 };
                 if blocks_traces {
-                    if let Some(routing_layer) = self.layers.iter().position(|&l| l == layer) {
-                        let reach = f64::from(self.half_width) + rule(self.trace_clearance_class) + STEP_REACH * self.h;
-                        self.mark(&shape, reach, Some(routing_layer));
+                    if let Some(routing_layer) =
+                        self.profile.layers.iter().position(|&l| l == layer)
+                    {
+                        let reach = f64::from(self.profile.half_width)
+                            + rule(self.profile.trace_clearance_class)
+                            + STEP_REACH * self.h;
+                        self.mark(&shape, reach, Some(routing_layer), owner);
                     }
                 }
                 if blocks_vias {
-                    if let Some(via) = self.via.clone() {
+                    if let Some(via) = self.profile.via.clone() {
                         let reach = via.radius + rule(via.clearance_class);
-                        self.mark(&shape, reach, None);
+                        self.mark(&shape, reach, None, owner);
                     }
                 }
             }
         }
     }
 
-    /// Marks the centres within `reach` of `shape`: on one routing layer, or the via mask.
-    fn mark(&mut self, shape: &copper_geometry::TileShape, reach: f64, routing_layer: Option<usize>) {
+    fn mark(
+        &mut self,
+        shape: &copper_geometry::TileShape,
+        reach: f64,
+        routing_layer: Option<usize>,
+        owner: i32,
+    ) {
         let bb: IntBox = shape.bounding_box();
-        let lo_i = (((f64::from(bb.ll.x) - reach - self.x0) / self.h).floor().max(0.0)) as usize;
-        let lo_j = (((f64::from(bb.ll.y) - reach - self.y0) / self.h).floor().max(0.0)) as usize;
-        let hi_i = ((((f64::from(bb.ur.x) + reach - self.x0) / self.h).ceil()) as usize).min(self.nx - 1);
-        let hi_j = ((((f64::from(bb.ur.y) + reach - self.y0) / self.h).ceil()) as usize).min(self.ny - 1);
+        let lo_i = (((f64::from(bb.ll.x) - reach - self.x0) / self.h)
+            .floor()
+            .max(0.0)) as usize;
+        let lo_j = (((f64::from(bb.ll.y) - reach - self.y0) / self.h)
+            .floor()
+            .max(0.0)) as usize;
+        let hi_i =
+            ((((f64::from(bb.ur.x) + reach - self.x0) / self.h).ceil()) as usize).min(self.nx - 1);
+        let hi_j =
+            ((((f64::from(bb.ur.y) + reach - self.y0) / self.h).ceil()) as usize).min(self.ny - 1);
         for j in lo_j..=hi_j {
             for i in lo_i..=hi_i {
-                if shape.distance(&self.centre(i, j)) < reach {
-                    match routing_layer {
-                        Some(layer) => {
-                            let index = self.index(layer, i, j);
-                            self.blocked[index] = true;
-                        }
-                        None => self.via_blocked[j * self.nx + i] = true,
-                    }
+                let centre = FloatPoint::new(
+                    self.x0 + (i as f64 + 0.5) * self.h,
+                    self.y0 + (j as f64 + 0.5) * self.h,
+                );
+                if shape.distance(&centre) >= reach {
+                    continue;
                 }
+                let slot = match routing_layer {
+                    Some(layer) => &mut self.owner[(layer * self.ny + j) * self.nx + i],
+                    None => &mut self.via_owner[j * self.nx + i],
+                };
+                *slot = match *slot {
+                    FREE => owner,
+                    current if current == owner => current,
+                    _ => SEVERAL,
+                };
             }
         }
     }

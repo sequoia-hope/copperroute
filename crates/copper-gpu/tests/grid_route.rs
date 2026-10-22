@@ -41,6 +41,7 @@ fn the_cpu_grid_router_closes_connections_without_any_new_violation() {
         cell: 0.1 * per_mm,
         via_cost: 200,
         max_attempts: 400,
+        max_seconds: None,
     };
     let started = std::time::Instant::now();
     let stats = route_open_connections(&mut board, &mut CpuSolver, &options, &|| false);
@@ -120,6 +121,7 @@ fn routing_on_the_gpu_adds_no_violation() {
         cell: 0.1 * per_mm,
         via_cost: 200,
         max_attempts: 400,
+        max_seconds: None,
     };
     let started = std::time::Instant::now();
     let stats = route_open_connections(&mut board, &mut gpu, &options, &|| false);

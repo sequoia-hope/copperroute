@@ -1,13 +1,13 @@
 //! Sequential grid routing: each open connection is routed on a fresh conservative grid of its
 //! net, with everything already on the board as obstacles, and committed as traces and vias.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use copper_board::items::Item;
 use copper_board::{Board, FixedState, ItemId};
 use copper_geometry::{FloatPoint, IntPoint, Point, Polyline};
 
-use crate::grid::RouteGrid;
+use crate::grid::{GridProfile, ObstacleMap, RouteGrid};
 use crate::search::{GridPath, cost_field, trace_back};
 
 /// Computes the cost field for a grid; the CPU reference or the GPU kernel.
@@ -30,6 +30,8 @@ pub struct GridOptions {
     pub via_cost: u32,
     /// Connections to attempt before giving up, so a board that cannot close does not spin.
     pub max_attempts: usize,
+    /// Wall-clock budget for grid routing, leaving the rest of the job to whatever follows.
+    pub max_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,53 +49,86 @@ pub fn route_open_connections(
     options: &GridOptions,
     stop: &dyn Fn() -> bool,
 ) -> GridStats {
+    let started = std::time::Instant::now();
+    let out_of_time = || {
+        stop()
+            || options
+                .max_seconds
+                .is_some_and(|limit| started.elapsed().as_secs_f64() > limit)
+    };
     let mut stats = GridStats::default();
-    let mut given_up: BTreeSet<(ItemId, Option<ItemId>)> = BTreeSet::new();
-    for _ in 0..options.max_attempts {
-        if stop() {
+    let mut given_up: BTreeSet<(ItemId, ItemId)> = BTreeSet::new();
+    let mut maps: BTreeMap<usize, ObstacleMap> = BTreeMap::new();
+    let mut attempts = 0;
+    'rounds: loop {
+        let gaps: Vec<(ItemId, ItemId)> = copper_drc::DesignRulesChecker::new(board)
+            .get_all_unconnected_items()
+            .into_iter()
+            .filter_map(|g| g.second_item.map(|second| (g.first_item, second)))
+            .filter(|pair| !given_up.contains(pair))
+            .collect();
+        if gaps.is_empty() {
             break;
         }
-        let gaps = copper_drc::DesignRulesChecker::new(board).get_all_unconnected_items();
-        let Some(gap) = gaps.into_iter().find(|g| {
-            g.second_item.is_some() && !given_up.contains(&(g.first_item, g.second_item))
-        }) else {
-            break;
-        };
-        let (from, to) = (gap.first_item, gap.second_item.expect("filtered"));
-        let Some(net) = board
-            .get_item(from)
-            .and_then(|i| i.net_nos().first().copied())
-        else {
-            given_up.insert((from, Some(to)));
-            continue;
-        };
-        let grid = RouteGrid::build(board, net, options.cell);
-        let sources = terminal_cells(board, &grid, from);
-        let targets = terminal_cells(board, &grid, to);
-        let cost = solver.solve(&grid, &sources, options.via_cost);
-        match trace_back(&grid, &cost, &targets, options.via_cost) {
-            Some(path) => {
-                let existing: BTreeSet<ItemId> = board.get_items().map(Item::id).collect();
-                let vias = commit(board, &grid, &path, from, to);
-                if board.connected_set(from, net, false).contains(&to) {
-                    stats.vias += vias;
-                    stats.routed += 1;
-                } else {
-                    let inserted: Vec<ItemId> = board
-                        .get_items()
-                        .map(Item::id)
-                        .filter(|id| !existing.contains(id))
-                        .collect();
-                    board.remove_items(inserted);
-                    stats.failed += 1;
-                    stats.not_joined += 1;
-                    given_up.insert((from, Some(to)));
-                }
+        let routed_before = stats.routed;
+        for (from, to) in gaps {
+            if out_of_time() || attempts >= options.max_attempts {
+                break 'rounds;
             }
-            None => {
+            attempts += 1;
+            let Some(net) = board
+                .get_item(from)
+                .and_then(|i| i.net_nos().first().copied())
+            else {
+                given_up.insert((from, to));
+                continue;
+            };
+            if board.get_item(to).is_none() || board.connected_set(from, net, false).contains(&to) {
+                continue;
+            }
+            let class = board
+                .rules
+                .nets
+                .get(net)
+                .map_or(usize::MAX, |n| n.net_class.0);
+            let map = maps.entry(class).or_insert_with(|| {
+                let mut map =
+                    ObstacleMap::new(board, GridProfile::for_net(board, net), options.cell);
+                let ids: Vec<ItemId> = board.get_items().map(Item::id).collect();
+                map.stamp(board, &ids);
+                map
+            });
+            let grid = RouteGrid::view(map, net);
+            let sources = terminal_cells(board, &grid, from);
+            let targets = terminal_cells(board, &grid, to);
+            let cost = solver.solve(&grid, &sources, options.via_cost);
+            let Some(path) = trace_back(&grid, &cost, &targets, options.via_cost) else {
                 stats.failed += 1;
-                given_up.insert((from, Some(to)));
+                given_up.insert((from, to));
+                continue;
+            };
+            let existing: BTreeSet<ItemId> = board.get_items().map(Item::id).collect();
+            let vias = commit(board, &grid, &path, from, to);
+            let inserted: Vec<ItemId> = board
+                .get_items()
+                .map(Item::id)
+                .filter(|id| !existing.contains(id))
+                .collect();
+            if board.connected_set(from, net, false).contains(&to) {
+                stats.vias += vias;
+                stats.routed += 1;
+                for map in maps.values_mut() {
+                    map.stamp(board, &inserted);
+                }
+            } else {
+                board.remove_items(inserted);
+                stats.failed += 1;
+                stats.not_joined += 1;
+                given_up.insert((from, to));
             }
+        }
+        if stats.routed == routed_before {
+            break;
         }
     }
     stats

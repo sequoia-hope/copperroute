@@ -15,6 +15,8 @@ use crate::backend::RouterBackend;
 const DEFAULT_CELL_MM: f64 = 0.1;
 const VIA_COST: u32 = 200;
 const MAX_ATTEMPTS: usize = 2_000;
+/// The share of the job timeout grid routing may use; the maze router gets the rest.
+const GRID_SHARE_OF_JOB: f64 = 0.4;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GridBackend;
@@ -42,10 +44,16 @@ impl RouterBackend for GridBackend {
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| *v > 0.0)
             .unwrap_or(DEFAULT_CELL_MM);
+        let job_seconds = settings
+            .job_timeout_string
+            .as_deref()
+            .and_then(crate::parse_timespan)
+            .map(|d| d.as_secs_f64());
         let options = GridOptions {
             cell: cell_mm * per_mm,
             via_cost: VIA_COST,
             max_attempts: MAX_ATTEMPTS,
+            max_seconds: job_seconds.map(|s| s * GRID_SHARE_OF_JOB),
         };
         let use_cpu = std::env::var_os("COPPERROUTE_GRID_CPU").is_some();
         let mut gpu = if use_cpu { None } else { GpuSolver::new() };
