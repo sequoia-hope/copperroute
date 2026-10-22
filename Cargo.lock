@@ -251,6 +251,7 @@ dependencies = [
  "copper-drc",
  "copper-dsn",
  "copper-geometry",
+ "copper-gpu",
  "copper-morph",
  "copper-router",
  "copper-settings",

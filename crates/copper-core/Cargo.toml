@@ -13,10 +13,14 @@ copper-dsn = { path = "../copper-dsn" }
 copper-settings = { path = "../copper-settings" }
 copper-board = { path = "../copper-board" }
 copper-geometry = { path = "../copper-geometry" }
+copper-gpu = { path = "../copper-gpu", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[features]
+gpu = ["dep:copper-gpu"]
 
 [dev-dependencies]
 testkit = { path = "../../tests/testkit" }

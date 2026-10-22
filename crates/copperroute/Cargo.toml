@@ -15,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 copper-geometry = { path = "../copper-geometry" }
 copper-settings = { path = "../copper-settings" }
-copper-core = { path = "../copper-core" }
+copper-core = { path = "../copper-core", features = ["gpu"] }
 copper-dsn = { path = "../copper-dsn" }
 copper-board = { path = "../copper-board" }
 copper-drc = { path = "../copper-drc" }

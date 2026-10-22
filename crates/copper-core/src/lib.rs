@@ -7,6 +7,8 @@ pub mod file_details;
 pub mod job;
 pub mod load;
 pub mod manifest;
+#[cfg(feature = "gpu")]
+pub mod grid_backend;
 pub mod nudge;
 pub mod pipeline;
 pub mod progress;

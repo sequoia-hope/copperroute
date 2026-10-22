@@ -80,8 +80,16 @@ impl RouterBackend for NoneBackend {
 
 pub const DEFAULT_BACKEND: &str = "maze";
 
+#[cfg(not(feature = "gpu"))]
 static BACKENDS: [&dyn RouterBackend; 3] =
     [&MazeBackend, &NoneBackend, &crate::nudge::NudgeBackend];
+#[cfg(feature = "gpu")]
+static BACKENDS: [&dyn RouterBackend; 4] = [
+    &MazeBackend,
+    &NoneBackend,
+    &crate::nudge::NudgeBackend,
+    &crate::grid_backend::GridBackend,
+];
 
 pub fn backends() -> &'static [&'static dyn RouterBackend] {
     &BACKENDS
