@@ -42,6 +42,9 @@ pub enum Command {
     Drc(DrcArgs),
     /// Print the board summary as JSON.
     Info(InfoArgs),
+    /// Move parts on a routed board toward target displacements, bending the copper with them,
+    /// and write the session with the new placement.
+    Settle(SettleArgs),
     /// Serve the routing tools over JSON-RPC on stdin/stdout.
     Mcp,
 }
@@ -110,6 +113,35 @@ pub struct DrcArgs {
     /// Where to write the report; stdout when omitted.
     #[arg(short, long)]
     pub output: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct SettleArgs {
+    /// A Specctra DSN, a KiCad board JSON, or a KiCad .kicad_pcb board.
+    pub input: PathBuf,
+    /// The routed session to start from.
+    #[arg(long)]
+    pub ses: PathBuf,
+    /// JSON object of component reference to [dx, dy] in millimetres.
+    #[arg(long)]
+    pub targets: PathBuf,
+    /// Where to write the settled session (.ses), placement included.
+    #[arg(short, long)]
+    pub output: PathBuf,
+    /// A KiCad .kicad_pro whose design rules are applied.
+    #[arg(long)]
+    pub kicad_project: Option<PathBuf>,
+    /// Allow ripping routed copper that is in the way; it then needs rerouting.
+    #[arg(long)]
+    pub soft: bool,
+    /// Largest step per part per cycle, in millimetres.
+    #[arg(long, default_value_t = 0.05)]
+    pub step_mm: f64,
+    #[arg(long, default_value_t = 600)]
+    pub max_cycles: usize,
+    /// Clearance kept beyond the rules, in millimetres.
+    #[arg(long, default_value_t = 0.015)]
+    pub guard_mm: f64,
 }
 
 #[derive(Args, Debug)]

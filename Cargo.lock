@@ -378,6 +378,7 @@ dependencies = [
  "copper-dsn",
  "copper-geometry",
  "copper-governor",
+ "copper-morph",
  "copper-router",
  "copper-settings",
  "serde",

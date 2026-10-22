@@ -47,6 +47,10 @@ pub fn run(raw: &[String]) -> ExitCode {
         },
         cli::Command::Drc(args) => commands::drc::run(&cli, args),
         cli::Command::Info(args) => commands::info::run(&cli, args),
+        cli::Command::Settle(args) => match commands::govern(&cli) {
+            Ok(_) => commands::settle::run(&cli, args),
+            Err(code) => code,
+        },
         cli::Command::Mcp => match commands::govern(&cli) {
             Ok(ceiling) => match mcp::stdio::run(commands::overrides(&cli, &[]), ceiling) {
                 0 => ExitCode::Ok,

@@ -1,6 +1,7 @@
 pub mod drc;
 pub mod info;
 pub mod route;
+pub mod settle;
 
 use crate::cli::Cli;
 use crate::ops::SettingsOverrides;
