@@ -58,6 +58,8 @@ pub struct RoutingResultManifest {
     pub exit_code: i32,
     #[serde(rename = "output_written")]
     pub output_written: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
 }
 
 fn serialize_board_statistics<S: Serializer>(
@@ -86,6 +88,7 @@ impl Default for RoutingResultManifest {
             final_state: None,
             exit_code: 0,
             output_written: false,
+            backend: None,
         }
     }
 }

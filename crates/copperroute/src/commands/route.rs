@@ -115,7 +115,7 @@ fn write_manifest(args: &RouteArgs, outcome: &RouteOutcome, written: bool, exit_
     }) else {
         return;
     };
-    let manifest = RoutingResultManifest::from_job(
+    let mut manifest = RoutingResultManifest::from_job(
         &outcome.job,
         Some(&args.input),
         written,
@@ -123,6 +123,7 @@ fn write_manifest(args: &RouteArgs, outcome: &RouteOutcome, written: bool, exit_
         &copper_core::now_utc_iso8601,
         Some(&outcome.result.stats),
     );
+    manifest.backend = Some(args.backend.name().to_string());
     if let Err(error) = RoutingResultManifest::write(Path::new(&path), &manifest) {
         tracing::error!("Couldn't write routing result manifest to '{path}': {error}");
     }
