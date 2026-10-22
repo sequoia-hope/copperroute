@@ -7,6 +7,7 @@ pub mod file_details;
 pub mod job;
 pub mod load;
 pub mod manifest;
+pub mod nudge;
 pub mod pipeline;
 pub mod progress;
 pub mod save;
@@ -15,9 +16,7 @@ pub mod stats_json;
 pub mod summary;
 pub mod timespan;
 
-pub use backend::{
-    DEFAULT_BACKEND, MazeBackend, NoneBackend, RouterBackend, backend, backends,
-};
+pub use backend::{DEFAULT_BACKEND, MazeBackend, NoneBackend, RouterBackend, backend, backends};
 pub use cancel::{CancelToken, Deadline, JobStopReason};
 pub use ctx::{Ctx, RoutingResult};
 pub use file_details::BoardFileDetails;
@@ -36,6 +35,7 @@ pub use manifest::{
     FixtureInfo, PhaseDetail, PhaseMetrics, RouterJobResourceUsage, RoutingResultManifest,
     SCHEMA_VERSION, format_utc_iso8601, now_utc_iso8601, resolve_git_sha, sha256_hex,
 };
+pub use nudge::NudgeBackend;
 pub use pipeline::RoutingPipeline;
 pub use progress::{SyncProgressSink, SyncProgressSinkView};
 pub use save::{calculate_crc32_for_board, save_as_specctra_session_ses};

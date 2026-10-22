@@ -153,3 +153,60 @@ fn the_drc_checker_agrees_no_violation_was_added() {
     );
     assert!(moved >= 5, "only {moved} moved");
 }
+
+#[test]
+fn a_nudged_placement_survives_a_session_round_trip() {
+    let read = || {
+        let path = testkit::fixture("Issue756-tomu-fpga.dsn");
+        match copper_dsn::read_board(
+            std::fs::File::open(&path).unwrap(),
+            None,
+            None,
+            &DsnReadOptions::default(),
+        ) {
+            BoardReadResult::Success {
+                board,
+                coordinate_transform,
+                ..
+            }
+            | BoardReadResult::OutlineMissing {
+                board,
+                coordinate_transform,
+                ..
+            } => (*board.unwrap(), coordinate_transform.unwrap()),
+            other => panic!("did not read: {other:?}"),
+        }
+    };
+    let (mut board, transform) = read();
+    let oracle = oracle();
+    let span = board.bounding_box.ur.x - board.bounding_box.ll.x;
+    let mut moved = Vec::new();
+    for id in movable_components(&board) {
+        let (fraction, _) =
+            oracle.line_search(&mut board, id, &IntVector::new(span / 60, span / 90));
+        let step = scale(&IntVector::new(span / 60, span / 90), fraction);
+        if step != IntVector::ZERO && oracle.translate(&mut board, id, &step) {
+            moved.push(id);
+        }
+    }
+    assert!(!moved.is_empty());
+    let mut session = Vec::new();
+    copper_dsn::ses_writer::write(&board, &transform, &mut session, "roundtrip").unwrap();
+
+    let (mut fresh, transform) = read();
+    let summary = copper_dsn::ses_reader::read(session.as_slice(), &mut fresh, &transform).unwrap();
+    assert_eq!(summary.components_moved, moved.len());
+    for component in board.components.get_all() {
+        let again = fresh
+            .components
+            .get_all()
+            .find(|c| c.name == component.name)
+            .unwrap();
+        assert_eq!(
+            component.get_location(),
+            again.get_location(),
+            "{}",
+            component.name
+        );
+    }
+}

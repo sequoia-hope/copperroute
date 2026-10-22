@@ -1,7 +1,7 @@
 use std::io::Read;
 
 use copper_board::{Board, FixedState, ItemClass, PadstackId};
-use copper_geometry::{IntPoint, Point, Polyline};
+use copper_geometry::{IntPoint, IntVector, Point, Polyline, Vector};
 
 use crate::coordinate_transform::CoordinateTransform;
 use crate::error::DsnError;
@@ -13,6 +13,7 @@ use crate::parser::scope_parameter::skip_scope;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SesImportSummary {
+    pub components_moved: usize,
     pub wires_imported: usize,
     pub vias_imported: usize,
     pub errors_encountered: usize,
@@ -33,6 +34,7 @@ pub fn read(
     let mut reader = SesReader {
         scanner,
         board,
+        components_moved: 0,
         specctra_layer_structure,
         session_file_scale_denominator: scale_factor,
         wires_imported: 0,
@@ -41,6 +43,7 @@ pub fn read(
     };
     reader.process_session_scope()?;
     Ok(SesImportSummary {
+        components_moved: reader.components_moved,
         wires_imported: reader.wires_imported,
         vias_imported: reader.vias_imported,
         errors_encountered: reader.errors_encountered,
@@ -50,6 +53,7 @@ pub fn read(
 struct SesReader<'a> {
     scanner: DsnScanner,
     board: &'a mut Board,
+    components_moved: usize,
     specctra_layer_structure: DsnLayerStructure,
     session_file_scale_denominator: f64,
     wires_imported: usize,
@@ -90,6 +94,11 @@ impl SesReader<'_> {
             if prev_token == Some(Token::Open) {
                 if token == Token::Kw(Keyword::Routes) {
                     self.process_routes_scope()?;
+                } else if token == Token::Kw(Keyword::PlacementScope) {
+                    self.process_container_scope(
+                        Keyword::ComponentScope,
+                        Self::process_component_scope,
+                    )?;
                 } else {
                     skip_scope(&mut self.scanner)?;
                 }
@@ -130,6 +139,102 @@ impl SesReader<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Moves each placed component to its session location. Only translation is applied: a
+    /// session that also turns or flips a component counts as an error for that component.
+    fn process_component_scope(&mut self) -> Result<(), DsnError> {
+        let mut next_token: Option<Token> = None;
+        loop {
+            let prev_token = next_token;
+            next_token = self.scanner.next_token()?;
+            let Some(token) = next_token.clone() else {
+                return Ok(());
+            };
+            if token == Token::Close {
+                break;
+            }
+            if prev_token == Some(Token::Open) {
+                if token == Token::Kw(Keyword::Place) {
+                    if !self.process_place_scope()? {
+                        self.errors_encountered += 1;
+                    }
+                } else {
+                    skip_scope(&mut self.scanner)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn process_place_scope(&mut self) -> Result<bool, DsnError> {
+        let Some(Token::Str(name)) = self.scanner.next_token()? else {
+            skip_scope(&mut self.scanner)?;
+            return Ok(false);
+        };
+        let mut location = [0.0f64; 2];
+        for slot in &mut location {
+            match self.scanner.next_token()? {
+                Some(Token::Float(value)) => *slot = value,
+                #[allow(clippy::cast_precision_loss)]
+                Some(Token::Int(value)) => *slot = value as f64,
+                _ => {
+                    skip_scope(&mut self.scanner)?;
+                    return Ok(false);
+                }
+            }
+        }
+        let on_front = match self.scanner.next_token()? {
+            Some(Token::Kw(Keyword::Front)) => true,
+            Some(Token::Kw(Keyword::Back)) => false,
+            _ => {
+                skip_scope(&mut self.scanner)?;
+                return Ok(false);
+            }
+        };
+        let rotation = match self.scanner.next_token()? {
+            Some(Token::Float(value)) => value,
+            #[allow(clippy::cast_precision_loss)]
+            Some(Token::Int(value)) => value as f64,
+            _ => {
+                skip_scope(&mut self.scanner)?;
+                return Ok(false);
+            }
+        };
+        skip_scope(&mut self.scanner)?;
+
+        let Some(component) = self.board.components.get_all().find(|c| c.name == name) else {
+            return Ok(false);
+        };
+        let Some(current) = component.get_location().map(Point::to_float) else {
+            return Ok(false);
+        };
+        if component.placed_on_front() != on_front
+            || (component.get_rotation_in_degree() - rotation)
+                .rem_euclid(360.0)
+                .min((rotation - component.get_rotation_in_degree()).rem_euclid(360.0))
+                > 0.01
+        {
+            return Ok(false);
+        }
+        let id = component.id;
+        let denominator = self.session_file_scale_denominator;
+        let delta = IntVector::new(
+            (location[0] / denominator - current.x).round() as i32,
+            (location[1] / denominator - current.y).round() as i32,
+        );
+        if delta == IntVector::ZERO {
+            return Ok(true);
+        }
+        let vector = Vector::Int(delta);
+        for item in self.board.get_component_items(id) {
+            if !matches!(self.board.move_item_by(item, &vector), Ok(true)) {
+                return Ok(false);
+            }
+        }
+        self.board.components.move_component(id, &vector);
+        self.components_moved += 1;
+        Ok(true)
     }
 
     fn process_net_scope(&mut self) -> Result<(), DsnError> {

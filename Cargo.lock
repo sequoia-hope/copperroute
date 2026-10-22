@@ -251,12 +251,14 @@ dependencies = [
  "copper-drc",
  "copper-dsn",
  "copper-geometry",
+ "copper-morph",
  "copper-router",
  "copper-settings",
  "serde",
  "serde_json",
  "testkit",
  "thiserror",
+ "tracing",
  "web-time",
 ]
 

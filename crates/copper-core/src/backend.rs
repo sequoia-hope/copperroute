@@ -80,14 +80,18 @@ impl RouterBackend for NoneBackend {
 
 pub const DEFAULT_BACKEND: &str = "maze";
 
-static BACKENDS: [&dyn RouterBackend; 2] = [&MazeBackend, &NoneBackend];
+static BACKENDS: [&dyn RouterBackend; 3] =
+    [&MazeBackend, &NoneBackend, &crate::nudge::NudgeBackend];
 
 pub fn backends() -> &'static [&'static dyn RouterBackend] {
     &BACKENDS
 }
 
 pub fn backend(name: &str) -> Option<&'static dyn RouterBackend> {
-    BACKENDS.iter().copied().find(|backend| backend.name() == name)
+    BACKENDS
+        .iter()
+        .copied()
+        .find(|backend| backend.name() == name)
 }
 
 #[cfg(test)]
