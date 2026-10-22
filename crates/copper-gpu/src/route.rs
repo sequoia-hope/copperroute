@@ -37,6 +37,8 @@ pub struct GridStats {
     pub routed: usize,
     pub failed: usize,
     pub vias: usize,
+    /// Paths found whose copper did not join the two items (counted in `failed`, and removed).
+    pub not_joined: usize,
 }
 
 pub fn route_open_connections(
@@ -71,8 +73,22 @@ pub fn route_open_connections(
         let cost = solver.solve(&grid, &sources, options.via_cost);
         match trace_back(&grid, &cost, &targets, options.via_cost) {
             Some(path) => {
-                stats.vias += commit(board, &grid, &path, from, to);
-                stats.routed += 1;
+                let existing: BTreeSet<ItemId> = board.get_items().map(Item::id).collect();
+                let vias = commit(board, &grid, &path, from, to);
+                if board.connected_set(from, net, false).contains(&to) {
+                    stats.vias += vias;
+                    stats.routed += 1;
+                } else {
+                    let inserted: Vec<ItemId> = board
+                        .get_items()
+                        .map(Item::id)
+                        .filter(|id| !existing.contains(id))
+                        .collect();
+                    board.remove_items(inserted);
+                    stats.failed += 1;
+                    stats.not_joined += 1;
+                    given_up.insert((from, Some(to)));
+                }
             }
             None => {
                 stats.failed += 1;
