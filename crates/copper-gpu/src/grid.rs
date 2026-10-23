@@ -19,6 +19,7 @@ pub struct ViaChoice {
     pub padstack: PadstackId,
     pub clearance_class: usize,
     pub radius: f64,
+    pub drill_radius: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -89,7 +90,12 @@ impl RouteGrid {
             trace_clearance_class: map.profile.trace_clearance_class,
             via: map.profile.via.clone(),
             blocked: map.owner.iter().map(|&o| !free(o)).collect(),
-            via_blocked: map.via_owner.iter().map(|&o| !free(o)).collect(),
+            via_blocked: map
+                .via_owner
+                .iter()
+                .zip(&map.hole_owner)
+                .map(|(&o, &h)| !free(o) || !free(h))
+                .collect(),
             penalty: Vec::new(),
         }
     }
@@ -135,14 +141,14 @@ impl GridProfile {
             .as_ref()
             .and_then(|c| c.get_via_rule())
             .and_then(|rule| {
-                rule.iter().next().map(|info| ViaChoice {
-                    padstack: info.get_padstack(),
-                    clearance_class: info.get_clearance_class_index(),
-                    radius: board
-                        .library
-                        .padstacks
-                        .get(info.get_padstack())
-                        .map_or(0.0, padstack_radius),
+                rule.iter().next().map(|info| {
+                    let padstack = board.library.padstacks.get(info.get_padstack());
+                    ViaChoice {
+                        padstack: info.get_padstack(),
+                        clearance_class: info.get_clearance_class_index(),
+                        radius: padstack.map_or(0.0, padstack_radius),
+                        drill_radius: padstack.map_or(0.0, Padstack::drill_radius),
+                    }
                 })
             });
         GridProfile {
@@ -194,6 +200,10 @@ pub struct ObstacleMap {
     ny: usize,
     owner: Vec<i32>,
     via_owner: Vec<i32>,
+    /// Per cell: whose via may be drilled here as far as holes go. A via's own centre stays its
+    /// net's, so a later path of the net can change layers through it instead of stacking a
+    /// second via on top.
+    hole_owner: Vec<i32>,
 }
 
 impl ObstacleMap {
@@ -213,6 +223,7 @@ impl ObstacleMap {
             ny,
             owner: vec![FREE; layers * nx * ny],
             via_owner: vec![FREE; nx * ny],
+            hole_owner: vec![FREE; nx * ny],
         }
     }
 
@@ -221,6 +232,7 @@ impl ObstacleMap {
         let constraints = resolve(board);
         let profile = self.profile.clone();
         for &id in items {
+            self.stamp_hole(board, &constraints, id);
             let (blocks_traces, blocks_vias, class, owner, other_rule) = {
                 let Some(item) = board.get_item(id) else {
                     continue;
@@ -278,6 +290,51 @@ impl ObstacleMap {
                         self.mark(&shape, reach, None, owner);
                     }
                 }
+            }
+        }
+    }
+
+    /// Blocks drilling within the hole-to-hole distance of `id`'s hole, for every net: holes
+    /// conflict whatever their nets.
+    fn stamp_hole(&mut self, board: &Board, constraints: &DrcConstraints, id: ItemId) {
+        let Some(via) = &self.profile.via else {
+            return;
+        };
+        let Some(hole) = copper_drc::checks::geometry::hole_of(board, id) else {
+            return;
+        };
+        let reuse_net = match board.get_item(id) {
+            Some(item @ Item::Via(_)) if item.net_count() == 1 => item.get_net_number(0),
+            _ => SEVERAL,
+        };
+        let reach = hole.radius
+            + via.drill_radius
+            + f64::from(constraints.hole_to_hole.unwrap_or(0).max(0));
+        let lo_i = ((hole.center.x - reach - self.x0) / self.h)
+            .floor()
+            .max(0.0) as usize;
+        let lo_j = ((hole.center.y - reach - self.y0) / self.h)
+            .floor()
+            .max(0.0) as usize;
+        let hi_i = (((hole.center.x + reach - self.x0) / self.h).ceil() as usize).min(self.nx - 1);
+        let hi_j = (((hole.center.y + reach - self.y0) / self.h).ceil() as usize).min(self.ny - 1);
+        for j in lo_j..=hi_j {
+            for i in lo_i..=hi_i {
+                let centre = FloatPoint::new(
+                    self.x0 + (i as f64 + 0.5) * self.h,
+                    self.y0 + (j as f64 + 0.5) * self.h,
+                );
+                let distance = centre.distance(&hole.center);
+                if distance >= reach {
+                    continue;
+                }
+                let owner = if distance < 1.0 { reuse_net } else { SEVERAL };
+                let slot = &mut self.hole_owner[j * self.nx + i];
+                *slot = match *slot {
+                    FREE => owner,
+                    current if current == owner => current,
+                    _ => SEVERAL,
+                };
             }
         }
     }

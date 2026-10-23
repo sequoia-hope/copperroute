@@ -472,3 +472,55 @@ fn blame_names_movable_parts_with_bounded_moves_and_never_fixed_ones() {
         assert!(length > 0.0 && length <= options.max_move, "{b:?}");
     }
 }
+
+#[test]
+fn grid_vias_keep_the_hole_to_hole_rule_and_never_stack() {
+    let mut board = read_board("Issue508-DAC2020_bm05.dsn");
+    let per_mm = board.communication.get_resolution(Unit::Mm);
+    let mut constraints = copper_drc::constraints::resolve(&board);
+    constraints.hole_to_hole = Some((0.25 * per_mm).round() as i32);
+    board.rules.drc_constraints = Some(constraints);
+    let before = violations(&mut board);
+    let negotiated = copper_gpu::route_negotiated(
+        &mut board,
+        &mut CpuSolver,
+        &copper_gpu::NegotiationOptions {
+            cell: 0.05 * per_mm,
+            threads: 12,
+            ..Default::default()
+        },
+        &|| false,
+    );
+    let sequential = route_open_connections(
+        &mut board,
+        &mut CpuSolver,
+        &GridOptions {
+            cell: 0.05 * per_mm,
+            via_cost: 200,
+            max_attempts: 400,
+            max_seconds: None,
+        },
+        &|| false,
+    );
+    let added: Vec<_> = violations(&mut board)
+        .difference(&before)
+        .cloned()
+        .collect();
+    let mut centres: Vec<_> = board
+        .get_items()
+        .filter(|item| matches!(item, copper_board::items::Item::Via(_)))
+        .filter_map(|item| board.drill_center(item.id()))
+        .collect();
+    let vias = centres.len();
+    centres.sort_by_key(|p| format!("{p:?}"));
+    centres.dedup();
+    eprintln!(
+        "bm05 at 0.05 mm with 0.25 mm hole-to-hole: {vias} vias; {negotiated:?}; {sequential:?}"
+    );
+    assert!(
+        negotiated.vias + sequential.vias > 0,
+        "no vias; the test proves nothing"
+    );
+    assert_eq!(centres.len(), vias, "vias stacked on one point");
+    assert!(added.is_empty(), "{:?}", &added[..added.len().min(6)]);
+}

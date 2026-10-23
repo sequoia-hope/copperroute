@@ -112,7 +112,11 @@ pub fn route_open_connections(
                 continue;
             };
             let existing: BTreeSet<ItemId> = board.get_items().map(Item::id).collect();
-            let vias = commit(board, &grid, &path, from, to);
+            let Some(vias) = commit(board, &grid, &path, from, to) else {
+                stats.failed += 1;
+                given_up.insert((from, to));
+                continue;
+            };
             let inserted: Vec<ItemId> = board
                 .get_items()
                 .map(Item::id)
@@ -296,14 +300,15 @@ fn anchor(board: &Board, item: ItemId, near: &FloatPoint) -> Option<Point> {
 }
 
 /// Inserts the path as traces (collinear runs merged) and vias, its ends extended to the
-/// terminals' anchors; returns the vias inserted.
+/// terminals' anchors; returns the vias inserted, or `None`, inserting nothing, when a via would
+/// be drilled too near another hole.
 pub(crate) fn commit(
     board: &mut Board,
     grid: &RouteGrid,
     path: &GridPath,
     from: ItemId,
     to: ItemId,
-) -> usize {
+) -> Option<usize> {
     let point = |&(_, i, j): &(usize, usize, usize)| {
         let c = grid.centre(i, j);
         Point::Int(IntPoint::new(c.x.round() as i32, c.y.round() as i32))
@@ -337,6 +342,7 @@ pub(crate) fn commit(
         run.push(*step);
     }
     close(&run, &mut runs);
+    let vias = vias_to_drill(board, grid, vias)?;
 
     if let (Some(first), Some(start)) = (runs.first_mut(), path.first()) {
         if let Some(a) = anchor(board, from, &grid.centre(start.1, start.2)) {
@@ -382,5 +388,52 @@ pub(crate) fn commit(
             }
         }
     }
-    inserted
+    Some(inserted)
+}
+
+/// The vias a path still needs once those already drilled for its net at the same points are
+/// reused; `None` when one would come nearer another hole than the hole-to-hole rule allows.
+fn vias_to_drill(board: &Board, grid: &RouteGrid, wanted: Vec<Point>) -> Option<Vec<Point>> {
+    let Some(via) = &grid.via else {
+        return Some(wanted);
+    };
+    let minimum = f64::from(
+        copper_drc::constraints::resolve(board)
+            .hole_to_hole
+            .unwrap_or(0)
+            .max(0),
+    );
+    let holes: Vec<(copper_drc::checks::geometry::Hole, bool)> = board
+        .get_items()
+        .filter_map(|item| {
+            let hole = copper_drc::checks::geometry::hole_of(board, item.id())?;
+            let reusable = matches!(item, Item::Via(_)) && item.net_nos() == [grid.net];
+            Some((hole, reusable))
+        })
+        .collect();
+    let mut drilled: Vec<FloatPoint> = Vec::new();
+    for at in wanted {
+        let centre = at.to_float();
+        let mut reused = false;
+        for (hole, reusable) in &holes {
+            let distance = centre.distance(&hole.center);
+            if *reusable && distance < 1.0 {
+                reused = true;
+            } else if distance - hole.radius - via.drill_radius < minimum {
+                return None;
+            }
+        }
+        for other in &drilled {
+            let distance = centre.distance(other);
+            if distance < 1.0 {
+                reused = true;
+            } else if distance - 2.0 * via.drill_radius < minimum {
+                return None;
+            }
+        }
+        if !reused {
+            drilled.push(centre);
+        }
+    }
+    Some(drilled.into_iter().map(|c| Point::Int(c.round())).collect())
 }

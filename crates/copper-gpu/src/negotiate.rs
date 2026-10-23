@@ -282,7 +282,9 @@ pub fn route_negotiated(
         }
         let grid = RouteGrid::view(&maps[&c.class], c.net);
         let existing: BTreeSet<ItemId> = board.get_items().map(Item::id).collect();
-        let vias = commit(board, &grid, path, c.from, c.to);
+        let Some(vias) = commit(board, &grid, path, c.from, c.to) else {
+            continue;
+        };
         if board.connected_set(c.from, c.net, false).contains(&c.to) {
             committed.add(c.net, &c.zone);
             stats.committed += 1;
