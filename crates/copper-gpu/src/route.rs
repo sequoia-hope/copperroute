@@ -227,21 +227,7 @@ fn escape_stubs(
     anchor: &FloatPoint,
     reach: f64,
 ) -> Vec<usize> {
-    let constraints = copper_drc::constraints::resolve(board);
-    let strictest = constraints
-        .netclass_clearance
-        .values()
-        .copied()
-        .chain(constraints.min_clearance)
-        .max()
-        .unwrap_or(0);
-    let matrix = board.rules.clearance_matrix.get_value(
-        grid.trace_clearance_class,
-        grid.trace_clearance_class,
-        layer,
-        false,
-    );
-    let half_width = grid.half_width + (strictest - matrix).max(0);
+    let half_width = grid.half_width + rule_margin(board, grid, layer);
     let r = (reach / grid.h).ceil() as i64;
     let ci = ((anchor.x - grid.x0) / grid.h - 0.5).round() as i64;
     let cj = ((anchor.y - grid.y0) / grid.h - 0.5).round() as i64;
@@ -300,8 +286,10 @@ fn anchor(board: &Board, item: ItemId, near: &FloatPoint) -> Option<Point> {
 }
 
 /// Inserts the path as traces (collinear runs merged) and vias, its ends extended to the
-/// terminals' anchors; returns the vias inserted, or `None`, inserting nothing, when a via would
-/// be drilled too near another hole.
+/// terminals' anchors; returns the vias inserted. Returns `None`, leaving the board as it was,
+/// when a via would be drilled too near another hole, when a leg to an anchor cannot fit even
+/// necked down, or when anything inserted breaks clearance (a leg or a path committed earlier
+/// in the same round, which no grid saw).
 pub(crate) fn commit(
     board: &mut Board,
     grid: &RouteGrid,
@@ -344,31 +332,50 @@ pub(crate) fn commit(
     close(&run, &mut runs);
     let vias = vias_to_drill(board, grid, vias)?;
 
-    if let (Some(first), Some(start)) = (runs.first_mut(), path.first()) {
-        if let Some(a) = anchor(board, from, &grid.centre(start.1, start.2)) {
-            if first.1.first() != Some(&a) {
-                first.1.insert(0, a);
+    let mut pieces: Vec<(usize, Vec<Point>, i32)> = Vec::new();
+    let mut legs: Vec<(usize, Point, Point, i32)> = Vec::new();
+    let last_run = runs.len().saturating_sub(1);
+    for (k, (layer, mut points)) in runs.into_iter().enumerate() {
+        if k == 0 {
+            if let Some(start) = path.first() {
+                if let Some(a) = anchor(board, from, &grid.centre(start.1, start.2)) {
+                    if points.first() != Some(&a) {
+                        let width = leg_half_width(board, grid, layer, &a, &points[0], from)?;
+                        legs.push((layer, a, points[0].clone(), width));
+                    }
+                }
             }
         }
-    }
-    if let (Some(last), Some(end)) = (runs.last_mut(), path.last()) {
-        if let Some(a) = anchor(board, to, &grid.centre(end.1, end.2)) {
-            if last.1.last() != Some(&a) {
-                last.1.push(a);
+        if k == last_run {
+            if let Some(end) = path.last() {
+                if let Some(a) = anchor(board, to, &grid.centre(end.1, end.2)) {
+                    let tail = points.last().expect("a run has a cell").clone();
+                    if tail != a {
+                        let width = leg_half_width(board, grid, layer, &tail, &a, to)?;
+                        legs.push((layer, tail, a, width));
+                    }
+                }
             }
         }
-    }
-    for (layer, points) in runs {
         if points.len() >= 2 {
-            board.insert_trace(
-                Polyline::from_points(&points),
-                grid.layers[layer],
-                grid.half_width,
-                vec![grid.net],
-                grid.trace_clearance_class,
-                FixedState::Unfixed,
-            );
+            pieces.push((layer, std::mem::take(&mut points), grid.half_width));
         }
+    }
+    pieces.extend(
+        legs.into_iter()
+            .map(|(layer, a, b, width)| (layer, vec![a, b], width)),
+    );
+
+    let existing: BTreeSet<ItemId> = board.get_items().map(Item::id).collect();
+    for (layer, points, half_width) in pieces {
+        board.insert_trace(
+            Polyline::from_points(&points),
+            grid.layers[layer],
+            half_width,
+            vec![grid.net],
+            grid.trace_clearance_class,
+            FixedState::Unfixed,
+        );
     }
     let mut inserted = 0;
     if let Some(via) = &grid.via {
@@ -388,7 +395,103 @@ pub(crate) fn commit(
             }
         }
     }
+    let added: Vec<ItemId> = board
+        .get_items()
+        .map(Item::id)
+        .filter(|id| !existing.contains(id))
+        .collect();
+    if !added.iter().all(|&id| keeps_clearance(board, id)) {
+        board.remove_items(added);
+        return None;
+    }
     Some(inserted)
+}
+
+/// Whether every shape of `id` keeps its clearance to the copper of other nets.
+fn keeps_clearance(board: &mut Board, id: ItemId) -> bool {
+    let (shapes, nets, class) = {
+        let ctx = board.ctx();
+        let Some(item) = board.get_item(id) else {
+            return true;
+        };
+        let shapes: Vec<(usize, usize)> = (0..item.tile_shape_count(&ctx))
+            .map(|index| (index, item.shape_layer(index, &ctx)))
+            .collect();
+        (shapes, item.net_nos().to_vec(), item.clearance_class())
+    };
+    shapes.into_iter().all(|(index, layer)| {
+        board
+            .item_tile_shape(id, index)
+            .is_none_or(|shape| board.check_trace_shape(&shape, layer, &nets, class, None))
+    })
+}
+
+/// How much wider than the clearance matrix allows a trace must be checked for the DRC's
+/// net-class rule to hold too.
+fn rule_margin(board: &Board, grid: &RouteGrid, layer: usize) -> i32 {
+    let constraints = copper_drc::constraints::resolve(board);
+    let strictest = constraints
+        .netclass_clearance
+        .values()
+        .copied()
+        .chain(constraints.min_clearance)
+        .max()
+        .unwrap_or(0);
+    let matrix = board.rules.clearance_matrix.get_value(
+        grid.trace_clearance_class,
+        grid.trace_clearance_class,
+        layer,
+        false,
+    );
+    (strictest - matrix).max(0)
+}
+
+fn fits(
+    board: &mut Board,
+    grid: &RouteGrid,
+    layer: usize,
+    a: &Point,
+    b: &Point,
+    half_width: i32,
+) -> bool {
+    let margin = rule_margin(board, grid, layer);
+    Polyline::from_points(&[a.clone(), b.clone()])
+        .offset_shape(half_width + margin, 0)
+        .is_some_and(|shape| {
+            board.check_trace_shape(&shape, layer, &[grid.net], grid.trace_clearance_class, None)
+        })
+}
+
+/// The widest half-width at which the leg from a path's last cell to a terminal's anchor fits:
+/// the net's own, else necked down to the terminal's narrowest side, never below the board's
+/// minimum track width.
+fn leg_half_width(
+    board: &mut Board,
+    grid: &RouteGrid,
+    routing_layer: usize,
+    a: &Point,
+    b: &Point,
+    terminal: ItemId,
+) -> Option<i32> {
+    let layer = grid.layers[routing_layer];
+    if fits(board, grid, layer, a, b, grid.half_width) {
+        return Some(grid.half_width);
+    }
+    let floor = copper_drc::constraints::resolve(board)
+        .min_track_width
+        .map(|w| (w + 1) / 2)?;
+    let narrowest = {
+        let ctx = board.ctx();
+        match board.get_item(terminal)? {
+            Item::Pin(pin) => (pin.min_width(&ctx) / 2.0).floor() as i32,
+            Item::Trace(trace) => trace.get_half_width(),
+            _ => floor,
+        }
+    };
+    [narrowest, floor]
+        .into_iter()
+        .filter(|&w| w >= floor && w < grid.half_width)
+        .find(|&w| fits(board, grid, layer, a, b, w))
 }
 
 /// The vias a path still needs once those already drilled for its net at the same points are
@@ -436,4 +539,84 @@ fn vias_to_drill(board: &Board, grid: &RouteGrid, wanted: Vec<Point>) -> Option<
         }
     }
     Some(drilled.into_iter().map(|c| Point::Int(c.round())).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use copper_board::structure::Unit;
+    use copper_dsn::{BoardReadResult, DsnReadOptions};
+
+    use super::*;
+    use crate::grid::RouteGrid;
+
+    fn bm05() -> Board {
+        let path = testkit::fixture("Issue508-DAC2020_bm05.dsn");
+        match copper_dsn::read_board(
+            std::fs::File::open(&path).unwrap(),
+            None,
+            None,
+            &DsnReadOptions::default(),
+        ) {
+            BoardReadResult::Success { board, .. }
+            | BoardReadResult::OutlineMissing { board, .. } => *board.unwrap(),
+            other => panic!("bm05 did not read: {other:?}"),
+        }
+    }
+
+    /// A one-cell path a millimetre from a pin, ending on the pin at both ends, and the grid it
+    /// was found on.
+    fn path_beside_a_pin(board: &mut Board) -> (ItemId, RouteGrid, GridPath, FloatPoint) {
+        let gap = copper_drc::DesignRulesChecker::new(board)
+            .get_all_unconnected_items()
+            .into_iter()
+            .find(|g| matches!(board.get_item(g.first_item), Some(Item::Pin(_))))
+            .expect("bm05 has an open pin");
+        let pin = gap.first_item;
+        let net = board.get_item(pin).unwrap().net_nos()[0];
+        let per_mm = board.communication.get_resolution(Unit::Mm);
+        let grid = RouteGrid::build(board, net, 0.1 * per_mm);
+        let centre = board.drill_center(pin).unwrap().to_float();
+        let i = ((centre.x + per_mm - grid.x0) / grid.h) as usize;
+        let j = ((centre.y - grid.y0) / grid.h) as usize;
+        (pin, grid, vec![(0, i, j)], centre)
+    }
+
+    #[test]
+    fn a_leg_to_a_pin_that_breaks_clearance_is_refused_and_nothing_is_left_behind() {
+        let mut clear = bm05();
+        let (pin, grid, path, _) = path_beside_a_pin(&mut clear);
+        assert!(
+            commit(&mut clear, &grid, &path, pin, pin).is_some(),
+            "the same path commits with nothing in its way"
+        );
+
+        let mut board = bm05();
+        let (pin, grid, path, centre) = path_beside_a_pin(&mut board);
+        let per_mm = board.communication.get_resolution(Unit::Mm);
+        let other_net = board
+            .get_items()
+            .flat_map(|item| item.net_nos().to_vec())
+            .find(|&n| n > 0 && n != grid.net)
+            .expect("another net");
+        let x = (centre.x + 0.5 * per_mm).round() as i32;
+        let (y0, y1) = (
+            (centre.y - per_mm).round() as i32,
+            (centre.y + per_mm).round() as i32,
+        );
+        board.insert_trace(
+            Polyline::from_points(&[
+                Point::Int(IntPoint::new(x, y0)),
+                Point::Int(IntPoint::new(x, y1)),
+            ]),
+            grid.layers[0],
+            grid.half_width,
+            vec![other_net],
+            grid.trace_clearance_class,
+            FixedState::Unfixed,
+        );
+        let before: BTreeSet<ItemId> = board.get_items().map(Item::id).collect();
+        assert_eq!(commit(&mut board, &grid, &path, pin, pin), None);
+        let after: BTreeSet<ItemId> = board.get_items().map(Item::id).collect();
+        assert_eq!(after, before);
+    }
 }
