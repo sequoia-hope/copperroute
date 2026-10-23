@@ -31,6 +31,9 @@ pub struct NegotiationOptions {
     /// Added to a cell's history each round a path there collides.
     pub history_step: u32,
     pub max_seconds: Option<f64>,
+    /// Worker threads for a round; above one, every net routes against the previous round's
+    /// congestion at once (Jacobi PathFinder) instead of one after another (Gauss-Seidel).
+    pub threads: usize,
 }
 
 impl Default for NegotiationOptions {
@@ -43,6 +46,7 @@ impl Default for NegotiationOptions {
             present_growth: 1.6,
             history_step: 10,
             max_seconds: None,
+            threads: 1,
         }
     }
 }
@@ -171,34 +175,65 @@ pub fn route_negotiated(
     };
     let mut history = vec![0u32; layers * cells];
     let mut present = options.present;
+    let terminals: Vec<(Vec<usize>, Vec<usize>)> = connections
+        .iter()
+        .map(|c| {
+            let grid = RouteGrid::view(&maps[&c.class], c.net);
+            (
+                terminal_cells(board, &grid, c.from),
+                terminal_cells(board, &grid, c.to),
+            )
+        })
+        .collect();
 
     for round in 0..options.max_rounds {
         if out_of_time() {
             break;
         }
         stats.rounds = round + 1;
-        for c in connections.iter_mut() {
-            if out_of_time() {
-                break;
+        if options.threads > 1 {
+            route_round_in_parallel(
+                &mut connections,
+                &maps,
+                &terminals,
+                &zones,
+                &history,
+                present,
+                options,
+                options
+                    .max_seconds
+                    .map(|limit| started + std::time::Duration::from_secs_f64(limit)),
+            );
+            zones = Zones {
+                count: vec![0; layers * cells],
+                per_net: BTreeMap::new(),
+            };
+            for c in connections.iter_mut() {
+                c.zone = c
+                    .path
+                    .as_ref()
+                    .map(|p| zone_of(p, nx, ny, layers, &trace_disc, &via_disc))
+                    .unwrap_or_default();
+                zones.add(c.net, &c.zone);
             }
-            zones.remove(c.net, &c.zone);
-            let mut grid = RouteGrid::view(&maps[&c.class], c.net);
-            grid.penalty = (0..layers * cells)
-                .map(|n| {
-                    let others = u32::from(zones.others(c.net, n));
-                    history[n] + (present * f64::from(others)).round() as u32
-                })
-                .collect();
-            let sources = terminal_cells(board, &grid, c.from);
-            let targets = terminal_cells(board, &grid, c.to);
-            let cost = solver.solve(&grid, &sources, options.via_cost);
-            c.path = trace_back(&grid, &cost, &targets, options.via_cost);
-            c.zone = c
-                .path
-                .as_ref()
-                .map(|p| zone_of(p, nx, ny, layers, &trace_disc, &via_disc))
-                .unwrap_or_default();
-            zones.add(c.net, &c.zone);
+        } else {
+            for (k, c) in connections.iter_mut().enumerate() {
+                if out_of_time() {
+                    break;
+                }
+                zones.remove(c.net, &c.zone);
+                let mut grid = RouteGrid::view(&maps[&c.class], c.net);
+                grid.penalty = penalties(&zones, &history, present, c.net);
+                let (sources, targets) = &terminals[k];
+                let cost = solver.solve(&grid, sources, options.via_cost);
+                c.path = trace_back(&grid, &cost, targets, options.via_cost);
+                c.zone = c
+                    .path
+                    .as_ref()
+                    .map(|p| zone_of(p, nx, ny, layers, &trace_disc, &via_disc))
+                    .unwrap_or_default();
+                zones.add(c.net, &c.zone);
+            }
         }
         let mut colliding = 0;
         for c in &connections {
@@ -262,6 +297,56 @@ pub fn route_negotiated(
         }
     }
     stats
+}
+
+fn penalties(zones: &Zones, history: &[u32], present: f64, net: i32) -> Vec<u32> {
+    (0..history.len())
+        .map(|n| history[n] + (present * f64::from(zones.others(net, n))).round() as u32)
+        .collect()
+}
+
+/// One Jacobi round: every connection routes on the CPU against the same congestion snapshot,
+/// spread over `options.threads` workers.
+#[allow(clippy::too_many_arguments)]
+fn route_round_in_parallel(
+    connections: &mut [Connection],
+    maps: &BTreeMap<usize, ObstacleMap>,
+    terminals: &[(Vec<usize>, Vec<usize>)],
+    zones: &Zones,
+    history: &[u32],
+    present: f64,
+    options: &NegotiationOptions,
+    deadline: Option<std::time::Instant>,
+) {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let jobs: Vec<(i32, usize)> = connections.iter().map(|c| (c.net, c.class)).collect();
+    let paths: Vec<std::sync::Mutex<Option<GridPath>>> = (0..connections.len())
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+    std::thread::scope(|scope| {
+        for _ in 0..options.threads {
+            scope.spawn(|| {
+                loop {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if k >= jobs.len() || deadline.is_some_and(|d| std::time::Instant::now() > d) {
+                        break;
+                    }
+                    let (net, class) = jobs[k];
+                    let mut grid = RouteGrid::view(&maps[&class], net);
+                    grid.penalty = penalties(zones, history, present, net);
+                    let (sources, targets) = &terminals[k];
+                    let cost = crate::search::cost_field(&grid, sources, options.via_cost);
+                    *paths[k].lock().expect("no worker panics") =
+                        trace_back(&grid, &cost, targets, options.via_cost);
+                }
+            });
+        }
+    });
+    for (c, path) in connections.iter_mut().zip(paths) {
+        if let Some(path) = path.into_inner().expect("no worker panics") {
+            c.path = Some(path);
+        }
+    }
 }
 
 /// The connections that would join all of a net's copper: a minimum spanning tree (Prim) over

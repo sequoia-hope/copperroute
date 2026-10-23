@@ -80,6 +80,7 @@ impl RouterBackend for GridBackend {
                 cell: options.cell,
                 via_cost: options.via_cost,
                 max_seconds: options.max_seconds,
+                threads: settings.max_threads.map_or(1, |t| t.max(1) as usize),
                 ..NegotiationOptions::default()
             };
             let stats = route_negotiated(board, solver, &negotiation, &halted);

@@ -387,3 +387,33 @@ fn batched_fields_against_the_cpu() {
         jobs[0].0.blocked.len()
     );
 }
+
+#[test]
+fn parallel_negotiation_adds_no_violation() {
+    let mut board = read_board("Issue508-DAC2020_bm05.dsn");
+    let per_mm = board.communication.get_resolution(Unit::Mm);
+    let before = violations(&mut board);
+    let open_before = copper_drc::DesignRulesChecker::new(&mut board)
+        .get_all_unconnected_items()
+        .len();
+    let started = std::time::Instant::now();
+    let options = copper_gpu::NegotiationOptions {
+        cell: 0.1 * per_mm,
+        threads: 12,
+        ..Default::default()
+    };
+    let stats = copper_gpu::route_negotiated(&mut board, &mut CpuSolver, &options, &|| false);
+    let open_after = copper_drc::DesignRulesChecker::new(&mut board)
+        .get_all_unconnected_items()
+        .len();
+    let added: Vec<_> = violations(&mut board)
+        .difference(&before)
+        .cloned()
+        .collect();
+    eprintln!(
+        "parallel negotiated bm05: open {open_before} -> {open_after}; {stats:?} in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+    assert!(added.is_empty(), "{:?}", &added[..added.len().min(6)]);
+    assert!(stats.committed > 0);
+}
