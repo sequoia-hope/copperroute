@@ -1030,8 +1030,11 @@ impl Pin {
         self.clear_derived_data();
     }
 
-    pub fn translate_by(&mut self, vector: &Vector) {
-        self.drill.map_center(|c| c.translate_by(vector));
+    /// The centre derives from the component's location, which the caller has already moved:
+    /// shifting a cached centre as well would move the pin twice whenever the move itself had
+    /// just computed it.
+    pub fn translate_by(&mut self, _vector: &Vector) {
+        self.drill.clear_center();
         self.clear_derived_data();
     }
 

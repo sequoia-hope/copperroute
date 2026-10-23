@@ -605,7 +605,8 @@ fn pin_transforms_throw_the_centre_away_instead_of_moving_it() {
 
     assert_eq!(pin.get_center(&ctx), Point::new(1030, 2000));
     pin.translate_by(&Vector::new(5, 7));
-    assert_eq!(pin.get_center(&ctx), Point::new(1035, 2007));
+    assert!(pin.drill.raw_center().is_none());
+    assert_eq!(pin.get_center(&ctx), Point::new(1030, 2000));
 }
 
 #[test]

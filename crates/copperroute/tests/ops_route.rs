@@ -121,3 +121,18 @@ fn a_bad_timeout_is_a_settings_error() {
     };
     assert!(matches!(error, OpError::Settings(_)), "{error}");
 }
+
+#[test]
+fn a_lock_holds_parts_while_routing_but_stays_out_of_the_session() {
+    let dir = scratch("lock");
+    let mut locked = request(
+        testkit::fixture("Issue143-rpi_splitter.dsn"),
+        OutputTarget::File(dir.join("out.ses")),
+        vec!["router.max_passes=1".to_string()],
+    );
+    locked.lock = vec!["J1".to_string(), "J2".to_string()];
+    let outcome = route(locked).unwrap();
+    let session = String::from_utf8_lossy(&outcome.session);
+    assert!(session.contains("(place J1 "), "{session}");
+    assert!(!session.contains("lock_type"), "{session}");
+}

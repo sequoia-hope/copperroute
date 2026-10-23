@@ -82,6 +82,11 @@ impl RouterBackend for NudgeBackend {
             open: unconnected_count(board),
             violations: violation_count(board),
         };
+        tracing::info!(
+            "nudge base: {} open, {} violation(s) after {first_pass_ms} ms",
+            nudger.open,
+            nudger.violations
+        );
         match NudgeMode::from_env() {
             NudgeMode::Blind => nudger.blind(board),
             #[cfg(feature = "gpu")]
@@ -92,10 +97,23 @@ impl RouterBackend for NudgeBackend {
             let mut finish = settings.clone();
             finish.max_passes = Some(TRIAL_PASSES);
             let finish_stop = RouterStop::with_deadline(TRIAL_MS * 3);
-            let finished = run_pipeline(board, &finish, &finish_stop, budget, progress)?;
-            result.optimizer_state = finished.optimizer_state;
-            result.optimizer_passes_completed = finished.optimizer_passes_completed;
-            result.final_statistics = finished.final_statistics;
+            let mut polished = board.clone();
+            let finished = run_pipeline(&mut polished, &finish, &finish_stop, budget, progress)?;
+            let open = unconnected_count(&mut polished);
+            let violations = violation_count(&mut polished);
+            tracing::info!(
+                "nudge finish: {open} open and {violations} violation(s), from {} and {}",
+                nudger.open,
+                nudger.violations
+            );
+            if open <= nudger.open && violations <= nudger.violations {
+                *board = polished;
+                result.optimizer_state = finished.optimizer_state;
+                result.optimizer_passes_completed = finished.optimizer_passes_completed;
+                result.final_statistics = finished.final_statistics;
+            } else {
+                result.final_statistics = copper_router::score::BoardStatistics::new(board);
+            }
         } else {
             result.final_statistics = copper_router::score::BoardStatistics::new(board);
         }
@@ -181,7 +199,13 @@ impl Nudger<'_> {
                 break;
             }
             let mut improved = false;
-            for (component, want) in targeted::moves(board, self.per_mm) {
+            let moves = targeted::moves(board, self.per_mm);
+            tracing::info!(
+                "nudge round {round}: {} open, {} candidate move(s)",
+                self.open,
+                moves.len()
+            );
+            for (component, want) in moves {
                 if halted(self.stop) {
                     return;
                 }
@@ -384,10 +408,13 @@ fn violation_count(board: &mut Board) -> usize {
         .len()
 }
 
+/// Gaps between two items only: a lone dangling item is listed too, but no move connects it.
 fn unconnected_count(board: &mut Board) -> usize {
     copper_drc::DesignRulesChecker::new(board)
         .get_all_unconnected_items()
-        .len()
+        .iter()
+        .filter(|gap| gap.second_item.is_some())
+        .count()
 }
 
 /// Components owning items of unclosed connections, most involved first.

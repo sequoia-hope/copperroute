@@ -100,11 +100,16 @@ pub fn route(request: RouteRequest) -> Result<RouteOutcome, OpError> {
         mut warnings,
         ..
     } = load(&request.load)?;
+    let mut locked = Vec::new();
     for name in &request.lock {
-        match board.components.get_by_name(name).map(|c| c.id) {
-            Some(id) => board.components.get_mut(id).position_fixed = true,
+        match board.components.get_by_name(name) {
+            Some(component) if !component.position_fixed => locked.push(component.id),
+            Some(_) => {}
             None => warnings.push(format!("--lock {name}: no such part on the board")),
         }
+    }
+    for &id in &locked {
+        board.components.get_mut(id).position_fixed = true;
     }
 
     if let OutputTarget::File(path) = &request.output {
@@ -155,6 +160,10 @@ pub fn route(request: RouteRequest) -> Result<RouteOutcome, OpError> {
     };
     job.state = state;
 
+    // A session that marks a part `lock_type position` is one KiCad refuses to import.
+    for &id in &locked {
+        board.components.get_mut(id).position_fixed = false;
+    }
     let session = match format {
         OutputFormat::Ses => {
             let mut buffer = Vec::new();

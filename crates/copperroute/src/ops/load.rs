@@ -286,8 +286,9 @@ fn import_session(session: Option<&Path>, board: &mut Board, transform: &Coordin
     }
     match copper_dsn::ses_reader::read(&bytes[..], board, transform) {
         Ok(summary) => tracing::info!(
-            "Session loaded from {}: {} wires, {} vias imported, {} errors",
+            "Session loaded from {}: {} components moved, {} wires, {} vias imported, {} errors",
             session.display(),
+            summary.components_moved,
             summary.wires_imported,
             summary.vias_imported,
             summary.errors_encountered

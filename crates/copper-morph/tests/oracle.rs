@@ -332,3 +332,40 @@ fn a_group_step_moves_wedged_parts_together_without_new_violations() {
     }
     assert!(convoys > 0, "no group got further than its lead part alone");
 }
+
+#[test]
+fn a_moved_pin_lands_once_whether_or_not_its_centre_was_known() {
+    let expected = read_board("Issue756-tomu-fpga.dsn");
+    let mut board = read_board("Issue756-tomu-fpga.dsn");
+    let id = movable_components(&board)[0];
+    let by = IntVector::new(5_000, -3_000);
+    board
+        .components
+        .move_component(id, &copper_geometry::Vector::Int(by));
+    for item in board.get_component_items(id) {
+        assert!(matches!(
+            board.move_item_by(item, &copper_geometry::Vector::Int(by)),
+            Ok(true)
+        ));
+    }
+    let (ctx, expected_ctx) = (board.ctx(), expected.ctx());
+    let mut pins = 0;
+    for item in board.get_component_items(id) {
+        let (Some(copper_board::Item::Pin(pin)), Some(copper_board::Item::Pin(before))) =
+            (board.get_item(item), expected.get_item(item))
+        else {
+            continue;
+        };
+        pins += 1;
+        assert_eq!(
+            pin.get_center(&ctx),
+            before
+                .get_center(&expected_ctx)
+                .translate_by(&copper_geometry::Vector::Int(by))
+        );
+    }
+    assert!(
+        pins > 0,
+        "the component has no pins; the test proves nothing"
+    );
+}
