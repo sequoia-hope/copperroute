@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use copper_geometry::bounding_directions::ShapeBoundingDirections;
 use copper_geometry::regular_tile_shape::RegularTileShape;
-use copper_geometry::{Circle, Point, Polyline, Shape, ShapeOps, TileShape};
+use copper_geometry::{Circle, Line, Point, Polyline, Shape, ShapeOps, TileShape};
 
 use crate::datastructures::{LeafId, ShapeTree, TreeEntry};
 use crate::ids::{ItemId, RoomId, TreeId, TreeObject};
@@ -365,15 +365,22 @@ impl ShapeSearchTree {
                     for i in 0..border_line_count {
                         let current = ops.border_line(i);
                         let next = ops.border_line((i + 1) % border_line_count);
-                        let shape = match (previous, current, next) {
-                            (Some(a), Some(b), Some(c)) => Polyline::from_lines(vec![a, b, c])
-                                .ok()
-                                .and_then(|polyline| {
-                                    polyline.offset_shape(half_width + cmp_value, 0)
-                                }),
-                            _ => None,
-                        };
-                        result.push(shape.map(|shape| self.regularise(shape)));
+                        let cuts = outline.piece_cuts(shape_index, i);
+                        let caps: Vec<Option<Line>> = std::iter::once(previous)
+                            .chain(cuts.into_iter().map(Some))
+                            .chain(std::iter::once(next))
+                            .collect();
+                        for ends in caps.windows(2) {
+                            let shape = match (ends[0], current, ends[1]) {
+                                (Some(a), Some(b), Some(c)) => Polyline::from_lines(vec![a, b, c])
+                                    .ok()
+                                    .and_then(|polyline| {
+                                        polyline.offset_shape(half_width + cmp_value, 0)
+                                    }),
+                                _ => None,
+                            };
+                            result.push(shape.map(|shape| self.regularise(shape)));
+                        }
                         previous = current;
                     }
                 }

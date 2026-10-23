@@ -493,6 +493,14 @@ impl TraceFixture {
     }
 
     pub fn skewed_outline() -> TraceFixture {
+        TraceFixture::outline(&[
+            Point::new(0, 0),
+            Point::new(3000, 500),
+            Point::new(1000, 2500),
+        ])
+    }
+
+    pub fn outline(corners: &[Point]) -> TraceFixture {
         let rules = BoardRules::new(
             layers(),
             ClearanceMatrix::get_default_instance(&layers(), 200),
@@ -503,11 +511,7 @@ impl TraceFixture {
             Item::BoardOutline(BoardOutline::new(
                 ItemHeader::new(ItemId(1), Vec::new(), 1, 0, FixedState::SystemFixed),
                 vec![PolylineShapeRef::Polygon(
-                    copper_geometry::PolygonShape::from_points(&[
-                        Point::new(0, 0),
-                        Point::new(3000, 500),
-                        Point::new(1000, 2500),
-                    ]),
+                    copper_geometry::PolygonShape::from_points(corners),
                 )],
             )),
         );

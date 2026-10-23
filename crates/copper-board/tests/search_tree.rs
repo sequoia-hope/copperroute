@@ -1348,14 +1348,16 @@ fn reduce_trace_shape_at_tie_pin_cuts_the_pin_out_of_the_end_tile() {
 fn the_45_degree_override_regularises_the_outline_line_bands_too() {
     let mut f = board_builder::TraceFixture::skewed_outline();
     let default_id = f.manager.get_default_tree().id();
+    let Item::BoardOutline(board_outline) = &f.items[&ItemId(1)] else {
+        unreachable!()
+    };
+    let pieces: usize = (0..3)
+        .map(|i| board_outline.piece_cuts(0, i).len() + 1)
+        .sum();
     let outline = &f.items[&ItemId(1)];
-    assert_eq!(
-        outline.tree_shape_count(default_id),
-        6,
-        "3 edges x 2 layers"
-    );
+    assert_eq!(outline.tree_shape_count(default_id), 2 * pieces);
     assert!(
-        (0..6).all(|i| matches!(
+        (0..2 * pieces).all(|i| matches!(
             outline.get_tree_shape(default_id, i),
             Some(TileShape::Simplex(_))
         )),
@@ -1365,7 +1367,8 @@ fn the_45_degree_override_regularises_the_outline_line_bands_too() {
     let auto = f.build_autoroute_tree(1);
     let outline = &f.items[&ItemId(1)];
     assert!(
-        (0..6).all(|i| matches!(outline.get_tree_shape(auto, i), Some(TileShape::Octagon(_)))),
+        (0..2 * pieces)
+            .all(|i| matches!(outline.get_tree_shape(auto, i), Some(TileShape::Octagon(_)))),
         "the 45-degree tree regularises every band"
     );
     assert_eq!(
@@ -1376,16 +1379,34 @@ fn the_45_degree_override_regularises_the_outline_line_bands_too() {
         outline.get_tree_shape(auto, 1).cloned(),
         Some(oct(800, 300, 3200, 2700, -1783, 2783, 3217, 3783))
     );
-    assert_eq!(
-        outline.get_tree_shape(auto, 2).cloned(),
-        Some(oct(-200, -200, 1200, 2700, -1783, 283, -283, 3783))
-    );
-    for i in 0..3 {
+    for i in 0..pieces {
         assert_eq!(
             outline.get_tree_shape(auto, i).cloned(),
-            outline.get_tree_shape(auto, i + 3).cloned()
+            outline.get_tree_shape(auto, i + pieces).cloned()
         );
     }
+}
+
+#[test]
+fn a_long_outline_edge_off_the_45_degree_grid_does_not_wall_in_the_board_beside_it() {
+    let mut f = board_builder::TraceFixture::outline(&[
+        Point::new(-4000, -4000),
+        Point::new(4000, -800),
+        Point::new(-4000, 4000),
+    ]);
+    let auto = f.build_autoroute_tree(1);
+    let outline = &f.items[&ItemId(1)];
+    let layer_shapes = outline.tree_shape_count(auto) / 2;
+    let shapes: Vec<&TileShape> = (0..layer_shapes)
+        .filter_map(|i| outline.get_tree_shape(auto, i))
+        .collect();
+    let on_the_edge = Point::new(0, -2400);
+    let inside_by_1000 = Point::new(-371, -1472);
+    assert!(shapes.iter().any(|shape| shape.contains(&on_the_edge)));
+    assert!(
+        !shapes.iter().any(|shape| shape.contains(&inside_by_1000)),
+        "an octagon around the whole edge reaches 1000 units into the board"
+    );
 }
 
 #[test]

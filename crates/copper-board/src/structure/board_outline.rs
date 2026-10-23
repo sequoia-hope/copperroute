@@ -1,13 +1,18 @@
 use std::sync::OnceLock;
 
 use copper_geometry::{
-    Area, FloatPoint, IntBox, IntPoint, PolylineArea, PolylineShapeRef, TileShape, Vector,
+    Area, FloatPoint, IntBox, IntPoint, Line, PolylineArea, PolylineShapeRef, TileShape, Vector,
 };
 
 use crate::ids::ItemId;
 use crate::items::header::ItemHeader;
 use crate::items::{BOARD_OUTLINE_HALF_WIDTH, ItemCtx};
 use crate::structure::FixedState;
+
+/// How far the bounding octagon of one piece of an outline edge's band may stray from the band.
+/// Routing trees keep only bounding octagons, so a long edge off the 45-degree grid is cut into
+/// pieces; as one piece its octagon reaches deep into the board and walls in pads near the edge.
+const OUTLINE_PIECE_OVERSHOOT: f64 = 5.0 * BOARD_OUTLINE_HALF_WIDTH as f64;
 
 #[derive(Debug, Clone)]
 pub struct BoardOutline {
@@ -17,6 +22,7 @@ pub struct BoardOutline {
     keepout_lines: Option<Vec<TileShape>>,
     keepout_convex_pieces: OnceLock<Option<Vec<TileShape>>>,
     keepout_outside_outline: bool,
+    piece_count: OnceLock<usize>,
 }
 
 impl PartialEq for BoardOutline {
@@ -38,6 +44,7 @@ impl BoardOutline {
             keepout_lines: None,
             keepout_convex_pieces: OnceLock::new(),
             keepout_outside_outline: false,
+            piece_count: OnceLock::new(),
         }
     }
 
@@ -71,7 +78,7 @@ impl BoardOutline {
             self.keepout_convex_pieces(ctx)
                 .map_or(0, |tiles| tiles.len() * layer_count)
         } else {
-            self.line_count() * layer_count
+            self.piece_count() * layer_count
         }
     }
 
@@ -100,6 +107,7 @@ impl BoardOutline {
         }
         self.keepout_lines = None;
         self.keepout_convex_pieces.take();
+        self.piece_count.take();
     }
 
     pub fn turn_90_degree(&mut self, factor: i32, pole: &IntPoint) {
@@ -111,6 +119,7 @@ impl BoardOutline {
         }
         self.keepout_lines = None;
         self.keepout_convex_pieces.take();
+        self.piece_count.take();
     }
 
     pub fn rotate_approx(&mut self, angle_in_degree: f64, pole: &FloatPoint) {
@@ -123,6 +132,7 @@ impl BoardOutline {
         }
         self.keepout_lines = None;
         self.keepout_convex_pieces.take();
+        self.piece_count.take();
     }
 
     pub fn change_placement_side(&mut self, pole: &IntPoint) {
@@ -134,6 +144,7 @@ impl BoardOutline {
         }
         self.keepout_lines = None;
         self.keepout_convex_pieces.take();
+        self.piece_count.take();
     }
 
     pub fn shape_count(&self) -> usize {
@@ -179,6 +190,48 @@ impl BoardOutline {
             .iter()
             .map(|shape| shape.as_ops().border_line_count())
             .sum()
+    }
+
+    fn piece_count(&self) -> usize {
+        *self.piece_count.get_or_init(|| {
+            (0..self.shapes.len())
+                .map(|shape_no| {
+                    (0..self.shapes[shape_no].as_ops().border_line_count())
+                        .map(|line_no| self.piece_cuts(shape_no, line_no).len() + 1)
+                        .sum::<usize>()
+                })
+                .sum()
+        })
+    }
+
+    /// Lines square to border line `line_no` of shape `shape_no` that cut its band into pieces
+    /// short enough for [`OUTLINE_PIECE_OVERSHOOT`], in order along the line.
+    pub fn piece_cuts(&self, shape_no: usize, line_no: usize) -> Vec<Line> {
+        let ops = self.shapes[shape_no].as_ops();
+        let count = ops.border_line_count();
+        let (Some(line), Some(from), Some(to)) = (
+            ops.border_line(line_no),
+            ops.corner_approx(line_no),
+            ops.corner_approx((line_no + 1) % count),
+        ) else {
+            return Vec::new();
+        };
+        let (dx, dy) = (to.x - from.x, to.y - from.y);
+        let eighth = std::f64::consts::FRAC_PI_4;
+        let off_grid = dy.atan2(dx).rem_euclid(eighth);
+        let off_grid = off_grid.min(eighth - off_grid);
+        let pieces = (dx.hypot(dy) * off_grid.sin() / OUTLINE_PIECE_OVERSHOOT).ceil();
+        if !(pieces > 1.0) {
+            return Vec::new();
+        }
+        let square = line.direction().get_vector().turn_90_degree(1);
+        (1..pieces as usize)
+            .map(|k| {
+                let t = k as f64 / pieces;
+                let at = FloatPoint::new(from.x + t * dx, from.y + t * dy).round();
+                Line::new(at, IntPoint::new(at.x + square.x, at.y + square.y))
+            })
+            .collect()
     }
 }
 
