@@ -220,3 +220,170 @@ fn the_gpu_matches_the_cpu_with_congestion_penalties() {
     let mismatches = cpu.iter().zip(&on_gpu).filter(|(a, b)| a != b).count();
     assert_eq!(mismatches, 0, "{mismatches} of {} nodes differ", cpu.len());
 }
+
+#[test]
+fn the_sweep_kernel_equals_the_cpu_reference_and_reports_speed() {
+    let (Some(mut sweep), Some(mut relax)) = (
+        copper_gpu::GpuSweepSolver::new(),
+        copper_gpu::GpuSolver::new(),
+    ) else {
+        eprintln!("no GPU adapter; skipped");
+        return;
+    };
+    let mut boards = vec![("bm05", read_board("Issue508-DAC2020_bm05.dsn"), 0.1)];
+    if let Ok(path) = std::env::var("GRID_DIAG_DSN") {
+        if let BoardReadResult::Success { board, .. }
+        | BoardReadResult::OutlineMissing { board, .. } = copper_dsn::read_board(
+            std::fs::File::open(path).unwrap(),
+            None,
+            None,
+            &DsnReadOptions::default(),
+        ) {
+            boards.push(("env board", *board.unwrap(), 0.05));
+        }
+    }
+    for (name, mut board, mm) in boards {
+        let per_mm = board.communication.get_resolution(Unit::Mm);
+        let gaps = copper_drc::DesignRulesChecker::new(&mut board).get_all_unconnected_items();
+        let (mut t_cpu, mut t_sweep, mut t_relax, mut compared) = (0.0, 0.0, 0.0, 0);
+        let mut nodes = 0;
+        for (k, gap) in gaps
+            .iter()
+            .filter(|g| g.second_item.is_some())
+            .take(6)
+            .enumerate()
+        {
+            let net = board.get_item(gap.first_item).unwrap().net_nos()[0];
+            let mut grid = copper_gpu::RouteGrid::build(&mut board, net, mm * per_mm);
+            nodes = grid.blocked.len();
+            if k % 2 == 1 {
+                let mut seed = 99u64 + k as u64;
+                grid.penalty = (0..grid.blocked.len())
+                    .map(|_| {
+                        seed = seed
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        ((seed >> 33) % 5) as u32 * 7
+                    })
+                    .collect();
+            }
+            let sources = copper_gpu::route::terminal_cells(&mut board, &grid, gap.first_item);
+            if sources.is_empty() {
+                continue;
+            }
+            let t = std::time::Instant::now();
+            let cpu = copper_gpu::search::cost_field(&grid, &sources, 200);
+            t_cpu += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let swept = copper_gpu::FieldSolver::solve(&mut sweep, &grid, &sources, 200);
+            t_sweep += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let relaxed = copper_gpu::FieldSolver::solve(&mut relax, &grid, &sources, 200);
+            t_relax += t.elapsed().as_secs_f64();
+            let mismatches = cpu.iter().zip(&swept).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                mismatches,
+                0,
+                "{name} net {net}: sweep differs on {mismatches} of {} nodes",
+                cpu.len()
+            );
+            assert_eq!(cpu, relaxed, "{name} net {net}: relax differs");
+            compared += 1;
+        }
+        eprintln!(
+            "{name} ({nodes} nodes): {compared} fields identical; cpu {t_cpu:.2}s, sweep {t_sweep:.2}s, bellman-ford {t_relax:.2}s"
+        );
+        assert!(compared > 0);
+    }
+}
+
+#[test]
+#[ignore = "benchmark: batched GPU fields against CPU, set GRID_DIAG_DSN"]
+fn batched_fields_against_the_cpu() {
+    let Some(mut gpu) = copper_gpu::GpuSolver::new() else {
+        return;
+    };
+    let path = std::env::var("GRID_DIAG_DSN").expect("GRID_DIAG_DSN");
+    let mut board = match copper_dsn::read_board(
+        std::fs::File::open(path).unwrap(),
+        None,
+        None,
+        &DsnReadOptions::default(),
+    ) {
+        BoardReadResult::Success { board, .. } | BoardReadResult::OutlineMissing { board, .. } => {
+            *board.unwrap()
+        }
+        other => panic!("{other:?}"),
+    };
+    let per_mm = board.communication.get_resolution(Unit::Mm);
+    let mut jobs: Vec<(copper_gpu::RouteGrid, Vec<usize>)> = Vec::new();
+    let nets: Vec<i32> = board
+        .get_items()
+        .filter(|i| i.is_drill_item())
+        .filter_map(|i| i.net_nos().first().copied())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    for net in nets {
+        let grid = copper_gpu::RouteGrid::build(&mut board, net, 0.05 * per_mm);
+        let pin = board
+            .get_items()
+            .find(|i| i.is_drill_item() && i.contains_net(net))
+            .map(|i| i.id())
+            .unwrap();
+        let sources = copper_gpu::route::terminal_cells(&mut board, &grid, pin);
+        if !sources.is_empty()
+            && jobs
+                .first()
+                .is_none_or(|(g, _)| g.blocked.len() == grid.blocked.len())
+        {
+            jobs.push((grid, sources));
+        }
+        if jobs.len() == 32 {
+            break;
+        }
+    }
+    let t = std::time::Instant::now();
+    let cpu: Vec<Vec<u32>> = jobs
+        .iter()
+        .map(|(g, s)| copper_gpu::search::cost_field(g, s, 200))
+        .collect();
+    let t_cpu = t.elapsed().as_secs_f64();
+    let t = std::time::Instant::now();
+    let threads: Vec<Vec<u32>> = std::thread::scope(|scope| {
+        let chunk = jobs.len().div_ceil(12);
+        let handles: Vec<_> = jobs
+            .chunks(chunk)
+            .map(|part| {
+                scope.spawn(move || {
+                    part.iter()
+                        .map(|(g, s)| copper_gpu::search::cost_field(g, s, 200))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    });
+    let t_threads = t.elapsed().as_secs_f64();
+    assert_eq!(cpu, threads);
+    for k in [4usize, 16, 32].into_iter().filter(|k| *k <= jobs.len()) {
+        let t = std::time::Instant::now();
+        let mut fields = Vec::new();
+        for batch in jobs.chunks(k) {
+            let refs: Vec<(&copper_gpu::RouteGrid, &[usize])> =
+                batch.iter().map(|(g, s)| (g, s.as_slice())).collect();
+            fields.extend(gpu.solve_batch(&refs, 200));
+        }
+        let t_gpu = t.elapsed().as_secs_f64();
+        assert_eq!(fields, cpu, "batch {k} differs");
+        eprintln!("batch {k:2}: gpu {t_gpu:.2}s for {} fields", jobs.len());
+    }
+    eprintln!(
+        "{} fields of {} nodes: cpu {t_cpu:.2}s, cpu 12 threads {t_threads:.2}s",
+        jobs.len(),
+        jobs[0].0.blocked.len()
+    );
+}

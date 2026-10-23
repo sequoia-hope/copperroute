@@ -20,57 +20,60 @@ pub struct GpuSolver {
     pub dispatches: u64,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Params {
-    nx: u32,
-    ny: u32,
-    layers: u32,
-    via_cost: u32,
-    via_allowed: u32,
-    _pad: [u32; 3],
+/// The first discrete or integrated adapter on Vulkan, Metal or DX12 (asking for every backend
+/// can hide a discrete GPU's Vulkan adapter behind its GL twin); `None` without one.
+pub(crate) fn open_device() -> Option<(wgpu::Device, wgpu::Queue, String)> {
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    descriptor.backends = wgpu::Backends::PRIMARY;
+    let instance = wgpu::Instance::new(descriptor);
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        ..Default::default()
+    }))
+    .ok()?;
+    let adapter_name = adapter.get_info().name;
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("copper-gpu"),
+        required_features: wgpu::Features::empty(),
+        required_limits: adapter.limits(),
+        ..Default::default()
+    }))
+    .ok()?;
+    Some((device, queue, adapter_name))
 }
 
-impl Params {
-    fn bytes(&self) -> Vec<u8> {
-        [
-            self.nx,
-            self.ny,
-            self.layers,
-            self.via_cost,
-            self.via_allowed,
-            0,
-            0,
-            0,
-        ]
-        .iter()
-        .flat_map(|v| v.to_le_bytes())
-        .collect()
-    }
+/// Copies `size` bytes of `buffer` back to the host and waits for them.
+pub(crate) fn read_back(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    size: u64,
+) -> Vec<u8> {
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("staging"),
+        size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
+    queue.submit([encoder.finish()]);
+    let slice = staging.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let bytes = slice
+        .get_mapped_range()
+        .map(|view| view.to_vec())
+        .unwrap_or_default();
+    staging.unmap();
+    bytes
 }
 
 impl GpuSolver {
-    /// The first discrete or integrated adapter on Vulkan, Metal or DX12 (asking for every
-    /// backend can hide a discrete GPU's Vulkan adapter behind its GL twin); `None` without one.
     pub fn new() -> Option<GpuSolver> {
-        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
-        descriptor.backends = wgpu::Backends::PRIMARY;
-        let instance = wgpu::Instance::new(descriptor);
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-            ..Default::default()
-        }))
-        .ok()?;
-        let adapter_name = adapter.get_info().name;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("copper-gpu"),
-            required_features: wgpu::Features::empty(),
-            required_limits: adapter.limits(),
-            ..Default::default()
-        }))
-        .ok()?;
+        let (device, queue, adapter_name) = open_device()?;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("relax"),
             source: wgpu::ShaderSource::Wgsl(include_str!("relax.wgsl").into()),
@@ -93,117 +96,115 @@ impl GpuSolver {
     }
 
     fn read_back(&self, buffer: &wgpu::Buffer, size: u64) -> Vec<u8> {
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging"),
-            size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
-        self.queue.submit([encoder.finish()]);
-        let slice = staging.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-        let bytes = slice
-            .get_mapped_range()
-            .map(|view| view.to_vec())
-            .unwrap_or_default();
-        staging.unmap();
-        bytes
+        read_back(&self.device, &self.queue, buffer, size)
     }
 }
 
 impl FieldSolver for GpuSolver {
     fn solve(&mut self, grid: &RouteGrid, sources: &[usize], via_cost: u32) -> Vec<u32> {
-        let nodes = grid.blocked.len();
-        let as_u32 = |flags: &[bool]| -> Vec<u8> {
-            flags
-                .iter()
-                .flat_map(|b| u32::from(*b).to_le_bytes())
-                .collect()
+        self.solve_batch(&[(grid, sources)], via_cost).remove(0)
+    }
+}
+
+impl GpuSolver {
+    /// Cost fields for several grids of one shape at once, one per net: the GPU only fills up
+    /// with many fields in flight.
+    pub fn solve_batch(&mut self, jobs: &[(&RouteGrid, &[usize])], via_cost: u32) -> Vec<Vec<u32>> {
+        let Some((first, _)) = jobs.first() else {
+            return Vec::new();
         };
-        let mut initial = vec![UNREACHED; nodes];
-        for &s in sources {
-            if !grid.blocked[s] {
-                initial[s] = 0;
+        let per_field = first.blocked.len();
+        let cells = first.nx * first.ny;
+        let nodes = per_field * jobs.len();
+        let mut blocked = Vec::with_capacity(nodes * 4);
+        let mut via_blocked = Vec::with_capacity(cells * jobs.len() * 4);
+        let mut penalty = Vec::with_capacity(nodes * 4);
+        let mut initial = Vec::with_capacity(nodes * 4);
+        for (grid, sources) in jobs {
+            assert_eq!(
+                grid.blocked.len(),
+                per_field,
+                "batched grids share one shape"
+            );
+            blocked.extend(
+                grid.blocked
+                    .iter()
+                    .flat_map(|&b| u32::from(b).to_le_bytes()),
+            );
+            via_blocked.extend(
+                grid.via_blocked
+                    .iter()
+                    .flat_map(|&b| u32::from(b).to_le_bytes()),
+            );
+            if grid.penalty.is_empty() {
+                penalty.extend(std::iter::repeat_n(0u8, per_field * 4));
+            } else {
+                penalty.extend(grid.penalty.iter().flat_map(|v| v.to_le_bytes()));
             }
+            let mut field = vec![UNREACHED; per_field];
+            for &s in *sources {
+                if !grid.blocked[s] {
+                    field[s] = 0;
+                }
+            }
+            initial.extend(field.iter().flat_map(|v| v.to_le_bytes()));
         }
-        let initial_bytes: Vec<u8> = initial.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let params = Params {
-            nx: grid.nx as u32,
-            ny: grid.ny as u32,
-            layers: grid.layers.len() as u32,
+        let params = [
+            first.nx as u32,
+            first.ny as u32,
+            first.layers.len() as u32,
             via_cost,
-            via_allowed: u32::from(grid.via.is_some()),
-            _pad: [0; 3],
-        };
-        let storage = |label, contents: &[u8], extra: wgpu::BufferUsages| {
+            u32::from(first.via.is_some()),
+            jobs.len() as u32,
+            0,
+            0,
+        ];
+        let buffer = |label, contents: &[u8], usage| {
             self.device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some(label),
                     contents,
-                    usage: wgpu::BufferUsages::STORAGE | extra,
+                    usage,
                 })
         };
-        let uniform = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("params"),
-                contents: &params.bytes(),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        let blocked = storage(
-            "blocked",
-            &as_u32(&grid.blocked),
-            wgpu::BufferUsages::empty(),
+        let storage = wgpu::BufferUsages::STORAGE;
+        let uniform = buffer(
+            "params",
+            &params
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            wgpu::BufferUsages::UNIFORM,
         );
-        let via_blocked = storage(
-            "via_blocked",
-            &as_u32(&grid.via_blocked),
-            wgpu::BufferUsages::empty(),
-        );
-        let cost = storage("cost", &initial_bytes, wgpu::BufferUsages::COPY_SRC);
-        let penalties: Vec<u8> = if grid.penalty.is_empty() {
-            vec![0u8; nodes * 4]
-        } else {
-            grid.penalty.iter().flat_map(|v| v.to_le_bytes()).collect()
-        };
-        let penalty = storage("penalty", &penalties, wgpu::BufferUsages::empty());
-        let changed = storage(
+        let blocked = buffer("blocked", &blocked, storage);
+        let via_blocked = buffer("via_blocked", &via_blocked, storage);
+        let cost = buffer("cost", &initial, storage | wgpu::BufferUsages::COPY_SRC);
+        let changed = buffer(
             "changed",
             &[0u8; 4],
-            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            storage | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         );
+        let penalty = buffer("penalty", &penalty, storage);
+        let resources = [
+            uniform.as_entire_binding(),
+            blocked.as_entire_binding(),
+            via_blocked.as_entire_binding(),
+            cost.as_entire_binding(),
+            changed.as_entire_binding(),
+            penalty.as_entire_binding(),
+        ];
+        let entries: Vec<wgpu::BindGroupEntry> = resources
+            .into_iter()
+            .enumerate()
+            .map(|(binding, resource)| wgpu::BindGroupEntry {
+                binding: binding as u32,
+                resource,
+            })
+            .collect();
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("relax"),
             layout: &self.pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: blocked.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: via_blocked.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: cost.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: changed.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: penalty.as_entire_binding(),
-                },
-            ],
+            entries: &entries,
         });
         let groups = (nodes as u32).div_ceil(WORKGROUP);
         let (gx, gy) = if groups <= MAX_GROUPS_X {
@@ -224,14 +225,15 @@ impl FieldSolver for GpuSolver {
             }
             self.queue.submit([encoder.finish()]);
             self.dispatches += u64::from(DISPATCHES_PER_BATCH);
-            let flag = self.read_back(&changed, 4);
-            if flag.iter().all(|b| *b == 0) {
+            if self.read_back(&changed, 4).iter().all(|b| *b == 0) {
                 break;
             }
         }
-        self.read_back(&cost, (nodes * 4) as u64)
+        let values: Vec<u32> = self
+            .read_back(&cost, (nodes * 4) as u64)
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
+            .collect();
+        values.chunks(per_field).map(<[u32]>::to_vec).collect()
     }
 }
