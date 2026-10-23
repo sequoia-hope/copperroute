@@ -3,7 +3,10 @@
 
 use copper_board::Board;
 use copper_board::structure::Unit;
-use copper_gpu::{CpuSolver, FieldSolver, GpuSolver, GridOptions, route_open_connections};
+use copper_gpu::{
+    CpuSolver, FieldSolver, GpuSolver, GridOptions, NegotiationOptions, route_negotiated,
+    route_open_connections,
+};
 use copper_router::RouterError;
 use copper_router::pipeline::{
     PipelineResult, ProgressSink, RouterBudget, RouterStop, run_pipeline,
@@ -72,6 +75,23 @@ impl RouterBackend for GridBackend {
             stop.poll_deadline();
             stop.is_stop_auto_router_requested()
         };
+        if std::env::var_os("COPPERROUTE_GRID_NEGOTIATE").is_some() {
+            let negotiation = NegotiationOptions {
+                cell: options.cell,
+                via_cost: options.via_cost,
+                max_seconds: options.max_seconds,
+                ..NegotiationOptions::default()
+            };
+            let stats = route_negotiated(board, solver, &negotiation, &halted);
+            tracing::info!(
+                "grid (negotiated): {} of {} connections committed after {} rounds, {} still colliding, {} without a path",
+                stats.committed,
+                stats.connections,
+                stats.rounds,
+                stats.conflicted,
+                stats.unroutable
+            );
+        }
         let stats = route_open_connections(board, solver, &options, &halted);
         tracing::info!(
             "grid: {} connections routed, {} left for the maze router, {} vias",
