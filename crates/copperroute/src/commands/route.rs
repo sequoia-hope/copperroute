@@ -40,6 +40,7 @@ pub fn run(cli: &Cli, args: &RouteArgs, memory_ceiling: Option<u64>) -> ExitCode
         visualize,
         memory_ceiling,
         backend: args.backend,
+        lock: args.lock.clone(),
     }) {
         Ok(outcome) => outcome,
         Err(error) => {

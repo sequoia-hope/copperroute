@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use copper_governor::{MemoryGuard, MemoryPressure};
 
 use copper_core::{
-    BoardFileDetails, CancelToken, Ctx, FileFormat, JobStopReason, RouterBudget, RoutingJob,
-    RouterBackend, RoutingJobState, RoutingPipeline, RoutingResult, SyncProgressSink,
+    BoardFileDetails, CancelToken, Ctx, FileFormat, JobStopReason, RouterBackend, RouterBudget,
+    RoutingJob, RoutingJobState, RoutingPipeline, RoutingResult, SyncProgressSink,
 };
 use copper_router::{RoutingVisualizationOptions, RoutingVisualizationSummary};
 use copper_settings::RouterSettings;
@@ -58,6 +58,8 @@ pub struct RouteRequest {
     pub visualize: Option<RoutingVisualizationOptions>,
     pub memory_ceiling: Option<u64>,
     pub backend: &'static dyn RouterBackend,
+    /// References of parts placement tools must not move.
+    pub lock: Vec<String>,
 }
 
 pub struct RouteOutcome {
@@ -98,6 +100,12 @@ pub fn route(request: RouteRequest) -> Result<RouteOutcome, OpError> {
         mut warnings,
         ..
     } = load(&request.load)?;
+    for name in &request.lock {
+        match board.components.get_by_name(name).map(|c| c.id) {
+            Some(id) => board.components.get_mut(id).position_fixed = true,
+            None => warnings.push(format!("--lock {name}: no such part on the board")),
+        }
+    }
 
     if let OutputTarget::File(path) = &request.output {
         job.try_to_set_output_file(Some(path));

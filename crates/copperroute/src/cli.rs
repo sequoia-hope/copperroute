@@ -45,6 +45,9 @@ pub enum Command {
     /// Move parts on a routed board toward target displacements, bending the copper with them,
     /// and write the session with the new placement.
     Settle(SettleArgs),
+    /// Report, for each open connection, what stands in its way and how far each movable part
+    /// in the way must move to clear it.
+    Blame(BlameArgs),
     /// Serve the routing tools over JSON-RPC on stdin/stdout.
     Mcp,
 }
@@ -77,6 +80,9 @@ pub struct RouteArgs {
     /// The routing approach to run.
     #[arg(long, default_value = copper_core::DEFAULT_BACKEND, value_parser = parse_backend)]
     pub backend: &'static dyn RouterBackend,
+    /// Parts placement tools must not move, by reference: --lock J1,U7. Repeatable.
+    #[arg(long, value_delimiter = ',', value_name = "REF")]
+    pub lock: Vec<String>,
     /// Override one setting: --set router.<section>.<field>=<value>. Repeatable.
     /// router.max_items=N stops the optimizer as well as the router; --max-passes stops
     /// only the router.
@@ -142,6 +148,32 @@ pub struct SettleArgs {
     /// Clearance kept beyond the rules, in millimetres.
     #[arg(long, default_value_t = 0.015)]
     pub guard_mm: f64,
+}
+
+#[derive(Args, Debug)]
+pub struct BlameArgs {
+    /// A Specctra DSN, a KiCad board JSON, or a KiCad .kicad_pcb board.
+    pub input: PathBuf,
+    /// A routed session to apply first, placement included.
+    #[arg(long)]
+    pub ses: Option<PathBuf>,
+    /// A KiCad .kicad_pro whose design rules are applied.
+    #[arg(long)]
+    pub kicad_project: Option<PathBuf>,
+    /// Parts that may not move, by reference: --lock J1,U7. Repeatable.
+    #[arg(long, value_delimiter = ',', value_name = "REF")]
+    pub lock: Vec<String>,
+    /// Cost of crossing a cell of routed copper, which the router may rip, against 10 per
+    /// step; omit to make routed copper a wall.
+    #[arg(long)]
+    pub routed_copper: Option<u32>,
+    #[arg(long, default_value_t = 0.05)]
+    pub cell_mm: f64,
+    /// Clearance kept beyond the rules, in millimetres.
+    #[arg(long, default_value_t = 0.045)]
+    pub margin_mm: f64,
+    #[arg(long, default_value_t = 1.5)]
+    pub max_move_mm: f64,
 }
 
 #[derive(Args, Debug)]
@@ -309,6 +341,26 @@ mod tests {
         };
         assert_eq!(r.backend.name(), "none");
         assert!(parse(&["--backend", "quantum"]).is_err());
+    }
+
+    #[test]
+    fn lock_takes_comma_lists_and_repeats() {
+        let cli = Cli::try_parse_from([
+            "copperroute",
+            "route",
+            "a.dsn",
+            "-o",
+            "b.ses",
+            "--lock",
+            "J1,U7",
+            "--lock",
+            "U20",
+        ])
+        .unwrap();
+        let Command::Route(r) = cli.command else {
+            panic!("expected route")
+        };
+        assert_eq!(r.lock, ["J1", "U7", "U20"]);
     }
 
     #[test]

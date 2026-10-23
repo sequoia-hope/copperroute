@@ -384,6 +384,7 @@ dependencies = [
  "copper-dsn",
  "copper-geometry",
  "copper-governor",
+ "copper-gpu",
  "copper-morph",
  "copper-router",
  "copper-settings",

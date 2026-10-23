@@ -1,3 +1,4 @@
+pub mod blame;
 pub mod drc;
 pub mod info;
 pub mod route;

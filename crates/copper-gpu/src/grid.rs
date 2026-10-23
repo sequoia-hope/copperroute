@@ -3,6 +3,7 @@
 //! every other net's copper. So any path the grid accepts is legal on the board; the grid may
 //! refuse legal paths, never the other way round.
 
+use copper_board::DrcConstraints;
 use copper_board::items::Item;
 use copper_board::library::Padstack;
 use copper_board::{Board, ItemId, PadstackId};
@@ -156,6 +157,31 @@ impl GridProfile {
     }
 }
 
+impl GridProfile {
+    /// The clearance between copper of the profile's `own_class` and an item of `other_class`
+    /// whose net class has the DRC rule `other_rule`: the strictest of the matrix and the rules.
+    pub fn clearance(
+        &self,
+        board: &Board,
+        constraints: &DrcConstraints,
+        own_class: usize,
+        other_class: usize,
+        layer: usize,
+        other_rule: i32,
+    ) -> f64 {
+        let matrix = board
+            .rules
+            .clearance_matrix
+            .get_value(own_class, other_class, layer, false);
+        f64::from(
+            matrix
+                .max(self.own_rule)
+                .max(other_rule)
+                .max(constraints.min_clearance.unwrap_or(0)),
+        )
+    }
+}
+
 /// Who blocks each cell for a profile: nobody, one net (which may still use it), or several
 /// nets or a netless obstacle. Built once, then stamped with each item added to the board.
 #[derive(Debug, Clone)]
@@ -193,6 +219,7 @@ impl ObstacleMap {
     /// Stamps `items` into the map.
     pub fn stamp(&mut self, board: &mut Board, items: &[ItemId]) {
         let constraints = resolve(board);
+        let profile = self.profile.clone();
         for &id in items {
             let (blocks_traces, blocks_vias, class, owner, other_rule) = {
                 let Some(item) = board.get_item(id) else {
@@ -232,18 +259,8 @@ impl ObstacleMap {
                 let Some(shape) = board.item_tile_shape(id, index) else {
                     continue;
                 };
-                let own_rule = self.profile.own_rule;
                 let rule = |own_class: usize| {
-                    let matrix = board
-                        .rules
-                        .clearance_matrix
-                        .get_value(own_class, class, layer, false);
-                    f64::from(
-                        matrix
-                            .max(own_rule)
-                            .max(other_rule)
-                            .max(constraints.min_clearance.unwrap_or(0)),
-                    )
+                    profile.clearance(board, &constraints, own_class, class, layer, other_rule)
                 };
                 if blocks_traces {
                     if let Some(routing_layer) =

@@ -417,3 +417,58 @@ fn parallel_negotiation_adds_no_violation() {
     assert!(added.is_empty(), "{:?}", &added[..added.len().min(6)]);
     assert!(stats.committed > 0);
 }
+
+/// `Issue508-DAC2020_bm05-grid.ses` is this repository's own `--backend grid` route of bm05
+/// (2026-10-22), which leaves 14 connections open.
+#[test]
+fn blame_names_movable_parts_with_bounded_moves_and_never_fixed_ones() {
+    let (mut board, transform) = match copper_dsn::read_board(
+        std::fs::File::open(testkit::fixture("Issue508-DAC2020_bm05.dsn")).unwrap(),
+        None,
+        None,
+        &DsnReadOptions::default(),
+    ) {
+        BoardReadResult::Success {
+            board,
+            coordinate_transform,
+            ..
+        }
+        | BoardReadResult::OutlineMissing {
+            board,
+            coordinate_transform,
+            ..
+        } => (*board.unwrap(), coordinate_transform.unwrap()),
+        other => panic!("did not read: {other:?}"),
+    };
+    let ses = std::fs::File::open(testkit::fixture("Issue508-DAC2020_bm05-grid.ses")).unwrap();
+    copper_dsn::ses_reader::read(ses, &mut board, &transform).unwrap();
+    let per_mm = board.communication.get_resolution(Unit::Mm);
+    let options = copper_gpu::BlameOptions {
+        cell: 0.05 * per_mm,
+        via_cost: 200,
+        margin: 0.045 * per_mm,
+        max_move: 1.5 * per_mm,
+        routed_copper: None,
+    };
+    let gaps: Vec<_> = copper_drc::DesignRulesChecker::new(&mut board)
+        .get_all_unconnected_items()
+        .into_iter()
+        .filter_map(|g| g.second_item.map(|second| (g.first_item, second)))
+        .collect();
+    let mut blamed = Vec::new();
+    for &(from, to) in &gaps {
+        blamed.extend(copper_gpu::blame(&mut board, from, to, &options, &|_| true).blamed);
+        let none_movable = copper_gpu::blame(&mut board, from, to, &options, &|_| false);
+        assert!(none_movable.blamed.is_empty() && none_movable.unmovable.is_empty());
+    }
+    eprintln!(
+        "bm05: {} open connections, {} blamed parts",
+        gaps.len(),
+        blamed.len()
+    );
+    assert!(!blamed.is_empty());
+    for b in &blamed {
+        let length = b.dx.hypot(b.dy);
+        assert!(length > 0.0 && length <= options.max_move, "{b:?}");
+    }
+}

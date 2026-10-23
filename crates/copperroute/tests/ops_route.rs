@@ -29,6 +29,7 @@ fn request(dsn: PathBuf, output: OutputTarget, set: Vec<String>) -> RouteRequest
         visualize: None,
         memory_ceiling: None,
         backend: &copper_core::MazeBackend,
+        lock: Vec::new(),
     }
 }
 
