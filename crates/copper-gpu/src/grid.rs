@@ -37,6 +37,15 @@ pub struct RouteGrid {
     pub blocked: Vec<bool>,
     /// Per cell: a via of the net may not stand here.
     pub via_blocked: Vec<bool>,
+    /// Per routing layer and cell: extra cost of entering it (negotiated congestion); empty
+    /// for none.
+    pub penalty: Vec<u32>,
+}
+
+impl RouteGrid {
+    pub fn penalty_at(&self, index: usize) -> u32 {
+        self.penalty.get(index).copied().unwrap_or(0)
+    }
 }
 
 impl RouteGrid {
@@ -80,6 +89,7 @@ impl RouteGrid {
             via: map.profile.via.clone(),
             blocked: map.owner.iter().map(|&o| !free(o)).collect(),
             via_blocked: map.via_owner.iter().map(|&o| !free(o)).collect(),
+            penalty: Vec::new(),
         }
     }
 }

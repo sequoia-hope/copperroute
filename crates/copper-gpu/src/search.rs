@@ -43,7 +43,7 @@ pub fn cost_field(grid: &RouteGrid, sources: &[usize], via_cost: u32) -> Vec<u32
         let cell = index % cells;
         let (i, j) = ((cell % grid.nx) as i32, (cell / grid.nx) as i32);
         let mut relax = |next: usize, step: u32| {
-            let candidate = c + step;
+            let candidate = c + step + grid.penalty_at(next);
             if candidate < cost[next] && !grid.blocked[next] {
                 cost[next] = candidate;
                 heap.push(Reverse((candidate, next)));
@@ -69,7 +69,12 @@ pub fn cost_field(grid: &RouteGrid, sources: &[usize], via_cost: u32) -> Vec<u32
 
 /// The cheapest route from any source to any target, by walking the cost field downhill from the
 /// cheapest target. Shared with the GPU path, which produces the same field.
-pub fn trace_back(grid: &RouteGrid, cost: &[u32], targets: &[usize], via_cost: u32) -> Option<GridPath> {
+pub fn trace_back(
+    grid: &RouteGrid,
+    cost: &[u32],
+    targets: &[usize],
+    via_cost: u32,
+) -> Option<GridPath> {
     let cells = grid.cell_count();
     let mut at = *targets
         .iter()
@@ -87,7 +92,7 @@ pub fn trace_back(grid: &RouteGrid, cost: &[u32], targets: &[usize], via_cost: u
                 continue;
             }
             let n = grid.index(layer, ni as usize, nj as usize);
-            if cost[n] != UNREACHED && cost[n] + step == cost[at] {
+            if cost[n] != UNREACHED && cost[n] + step + grid.penalty_at(at) == cost[at] {
                 previous = Some(n);
                 break;
             }
@@ -96,7 +101,9 @@ pub fn trace_back(grid: &RouteGrid, cost: &[u32], targets: &[usize], via_cost: u
             previous = (0..grid.layers.len())
                 .filter(|&other| other != layer)
                 .map(|other| other * cells + cell)
-                .find(|&n| cost[n] != UNREACHED && cost[n] + via_cost == cost[at]);
+                .find(|&n| {
+                    cost[n] != UNREACHED && cost[n] + via_cost + grid.penalty_at(at) == cost[at]
+                });
         }
         at = previous?;
         path.push(at);

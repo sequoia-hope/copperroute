@@ -10,6 +10,10 @@ use copper_geometry::{FloatPoint, IntPoint, Point, Polyline};
 use crate::grid::{GridProfile, ObstacleMap, RouteGrid};
 use crate::search::{GridPath, cost_field, trace_back};
 
+/// How far past a pad an escape stub may reach, in cells, and how many stubs are tried.
+const STUB_CELLS: f64 = 3.0;
+const STUB_CANDIDATES: usize = 24;
+
 /// Computes the cost field for a grid; the CPU reference or the GPU kernel.
 pub trait FieldSolver {
     fn solve(&mut self, grid: &RouteGrid, sources: &[usize], via_cost: u32) -> Vec<u32>;
@@ -180,8 +184,97 @@ pub fn terminal_cells(board: &mut Board, grid: &RouteGrid, item: ItemId) -> Vec<
                 }
             }
         }
+        let anchors: Vec<FloatPoint> = if ends.is_empty() {
+            board
+                .drill_center(item)
+                .map(|c| c.to_float())
+                .into_iter()
+                .collect()
+        } else {
+            ends.clone()
+        };
+        let reach =
+            f64::from((bb.ur.x - bb.ll.x).max(bb.ur.y - bb.ll.y)) / 2.0 + STUB_CELLS * grid.h;
+        for anchor in anchors {
+            cells.extend(escape_stubs(
+                board,
+                grid,
+                routing_layer,
+                layer,
+                &anchor,
+                reach,
+            ));
+        }
     }
+    cells.sort_unstable();
+    cells.dedup();
     cells
+}
+
+/// Free cells within `reach` of `anchor` that a straight trace from the anchor reaches legally,
+/// nearest first and at most `STUB_CANDIDATES` tried: how a path escapes a pad too small to hold
+/// a free cell centre of its own. Legality is the board's exact check, with the trace widened by
+/// however much the DRC's net-class rule exceeds the router's clearance matrix.
+fn escape_stubs(
+    board: &mut Board,
+    grid: &RouteGrid,
+    routing_layer: usize,
+    layer: usize,
+    anchor: &FloatPoint,
+    reach: f64,
+) -> Vec<usize> {
+    let constraints = copper_drc::constraints::resolve(board);
+    let strictest = constraints
+        .netclass_clearance
+        .values()
+        .copied()
+        .chain(constraints.min_clearance)
+        .max()
+        .unwrap_or(0);
+    let matrix = board.rules.clearance_matrix.get_value(
+        grid.trace_clearance_class,
+        grid.trace_clearance_class,
+        layer,
+        false,
+    );
+    let half_width = grid.half_width + (strictest - matrix).max(0);
+    let r = (reach / grid.h).ceil() as i64;
+    let ci = ((anchor.x - grid.x0) / grid.h - 0.5).round() as i64;
+    let cj = ((anchor.y - grid.y0) / grid.h - 0.5).round() as i64;
+    let mut candidates: Vec<(f64, usize, FloatPoint)> = Vec::new();
+    for j in (cj - r).max(0)..=(cj + r).min(grid.ny as i64 - 1) {
+        for i in (ci - r).max(0)..=(ci + r).min(grid.nx as i64 - 1) {
+            let index = grid.index(routing_layer, i as usize, j as usize);
+            if grid.blocked[index] {
+                continue;
+            }
+            let centre = grid.centre(i as usize, j as usize);
+            let d = (centre.x - anchor.x).hypot(centre.y - anchor.y);
+            if d <= reach {
+                candidates.push((d, index, centre));
+            }
+        }
+    }
+    candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let start = Point::Int(IntPoint::new(
+        anchor.x.round() as i32,
+        anchor.y.round() as i32,
+    ));
+    let mut found = Vec::new();
+    for (_, index, centre) in candidates.into_iter().take(STUB_CANDIDATES) {
+        let end = Point::Int(IntPoint::new(
+            centre.x.round() as i32,
+            centre.y.round() as i32,
+        ));
+        let Some(shape) = Polyline::from_points(&[start.clone(), end]).offset_shape(half_width, 0)
+        else {
+            continue;
+        };
+        if board.check_trace_shape(&shape, layer, &[grid.net], grid.trace_clearance_class, None) {
+            found.push(index);
+        }
+    }
+    found
 }
 
 /// The exact point a trace must end on to contact `item`: a drill item's centre, or the end
@@ -204,7 +297,13 @@ fn anchor(board: &Board, item: ItemId, near: &FloatPoint) -> Option<Point> {
 
 /// Inserts the path as traces (collinear runs merged) and vias, its ends extended to the
 /// terminals' anchors; returns the vias inserted.
-fn commit(board: &mut Board, grid: &RouteGrid, path: &GridPath, from: ItemId, to: ItemId) -> usize {
+pub(crate) fn commit(
+    board: &mut Board,
+    grid: &RouteGrid,
+    path: &GridPath,
+    from: ItemId,
+    to: ItemId,
+) -> usize {
     let point = |&(_, i, j): &(usize, usize, usize)| {
         let c = grid.centre(i, j);
         Point::Int(IntPoint::new(c.x.round() as i32, c.y.round() as i32))

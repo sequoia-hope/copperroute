@@ -16,6 +16,7 @@ struct Params {
 @group(0) @binding(2) var<storage, read> via_blocked: array<u32>;
 @group(0) @binding(3) var<storage, read_write> cost: array<atomic<u32>>;
 @group(0) @binding(4) var<storage, read_write> changed: atomic<u32>;
+@group(0) @binding(5) var<storage, read> penalty: array<u32>;
 
 const UNREACHED: u32 = 0xffffffffu;
 
@@ -23,8 +24,9 @@ fn offer(n: u32, value: u32) {
     if (blocked[n] != 0u) {
         return;
     }
-    let old = atomicMin(&cost[n], value);
-    if (value < old) {
+    let entered = value + penalty[n];
+    let old = atomicMin(&cost[n], entered);
+    if (entered < old) {
         atomicStore(&changed, 1u);
     }
 }

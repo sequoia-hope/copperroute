@@ -164,6 +164,12 @@ impl FieldSolver for GpuSolver {
             wgpu::BufferUsages::empty(),
         );
         let cost = storage("cost", &initial_bytes, wgpu::BufferUsages::COPY_SRC);
+        let penalties: Vec<u8> = if grid.penalty.is_empty() {
+            vec![0u8; nodes * 4]
+        } else {
+            grid.penalty.iter().flat_map(|v| v.to_le_bytes()).collect()
+        };
+        let penalty = storage("penalty", &penalties, wgpu::BufferUsages::empty());
         let changed = storage(
             "changed",
             &[0u8; 4],
@@ -192,6 +198,10 @@ impl FieldSolver for GpuSolver {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: changed.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: penalty.as_entire_binding(),
                 },
             ],
         });
