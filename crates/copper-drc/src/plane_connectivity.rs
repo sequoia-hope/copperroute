@@ -10,7 +10,7 @@ const HALF_CELL_DIAGONAL: f64 = std::f64::consts::FRAC_1_SQRT_2;
 /// A Specctra design carries no zone clearance, only the net-class clearance the tracks were
 /// routed with; KiCad fills its zones with its own zone clearance, 0.5 mm unless the board
 /// says otherwise, so the pour retreats further from the tracks than the routing rules imply.
-const ASSUMED_ZONE_CLEARANCE_MM: f64 = 0.5;
+pub const ASSUMED_ZONE_CLEARANCE_MM: f64 = 0.5;
 
 /// The copper clusters each plane net falls into once its pours are refilled around the routed
 /// items. A pour keeps the rule clearance from every other-net item and drops copper narrower

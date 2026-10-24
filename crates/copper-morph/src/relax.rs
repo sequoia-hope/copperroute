@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use copper_board::items::Item;
 use copper_board::structure::{FixedState, Unit};
 use copper_board::{Board, ItemId};
-use copper_geometry::{FloatPoint, IntPoint, Point, Polyline};
+use copper_geometry::{FloatPoint, IntPoint, Point, Polyline, ShapeOps};
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RelaxReport {
@@ -57,6 +57,9 @@ struct Blob {
     class: usize,
     polygon: Vec<FloatPoint>,
     centre: FloatPoint,
+    /// Touches a pour of its own net, which a refill keeps the zone clearance from other nets'
+    /// copper: crowd it and the pour's neck to this pad is cut.
+    fed: bool,
 }
 
 struct ViaNode {
@@ -82,6 +85,7 @@ pub fn relax_clearance(
     let cell = CELL_MM * per_mm;
     let max_step = MAX_STEP_MM * per_mm;
     let slack = SLACK_MM * per_mm;
+    let zone = copper_drc::plane_connectivity::ASSUMED_ZONE_CLEARANCE_MM * per_mm;
     let (mut wires, blobs, joints, vias) = collect(board, free_vias);
     let mut offset = vec![(0.0, 0.0); vias.len()];
     let edge_class = board.get_items().find_map(|item| match item {
@@ -189,9 +193,8 @@ pub fn relax_clearance(
                     if blob.nets.iter().any(|n| wire.nets.contains(n)) {
                         continue;
                     }
-                    let need = wire.half
-                        + f64::from(board.clearance_value(wire.class, blob.class, wire.layer))
-                        + slack;
+                    let clearance = f64::from(board.clearance_value(wire.class, blob.class, wire.layer));
+                    let need = wire.half + if blob.fed { clearance.max(zone) } else { clearance } + slack;
                     let (d, ta, pa, pb) = to_polygon(a0, a1, polygon(b));
                     if d >= need {
                         continue;
@@ -614,6 +617,7 @@ fn collect(board: &Board, free_vias: bool) -> (Vec<Wire>, Vec<Blob>, usize, Vec<
                         polygon.iter().map(|p| p.y).sum::<f64>() / n,
                     );
                     blobs.push(Blob {
+                        fed: false,
                         via,
                         layer: first + i,
                         nets: item.net_nos().to_vec(),
@@ -626,6 +630,25 @@ fn collect(board: &Board, free_vias: bool) -> (Vec<Wire>, Vec<Blob>, usize, Vec<
             _ => {}
         }
     }
+    let mut pours: Vec<(usize, Vec<i32>, Vec<FloatPoint>)> = Vec::new();
+    for item in board.get_items() {
+        if let Item::ConductionArea(area) = item {
+            let border = area_border(area.get_area(&ctx));
+            if border.len() >= 3 {
+                pours.push((item.first_layer(&ctx), item.net_nos().to_vec(), border));
+            }
+        }
+    }
+    for blob in &mut blobs {
+        blob.fed = pours.iter().any(|(l, n, border)| {
+            *l == blob.layer
+                && n.iter().any(|x| blob.nets.contains(x))
+                && (blob.polygon.iter().any(|p| inside(border, p)) || border.iter().any(|p| inside(&blob.polygon, p)))
+        });
+    }
+    let in_own_pour = |p: &FloatPoint, layer: usize, nets: &[i32]| {
+        pours.iter().any(|(l, n, border)| *l == layer && n.iter().any(|x| nets.contains(x)) && inside(border, p))
+    };
     let mut meeting: HashMap<usize, usize> = HashMap::new();
     for wire in &mut wires {
         let keys: Vec<(i32, i32)> = wire.points.iter().map(|p| (p.x.round() as i32, p.y.round() as i32)).collect();
@@ -633,7 +656,11 @@ fn collect(board: &Board, free_vias: bool) -> (Vec<Wire>, Vec<Blob>, usize, Vec<
         for j in wire.joint.iter().flatten() {
             *meeting.entry(*j).or_insert(0) += 1;
         }
-        wire.movable = keys.iter().map(|k| !held.contains(k)).collect();
+        wire.movable = keys
+            .iter()
+            .zip(&wire.points)
+            .map(|(k, p)| !held.contains(k) && !in_own_pour(p, wire.layer, &wire.nets))
+            .collect();
     }
     // An end that meets no other trace and no free via ends on a pad or a pour, whatever its
     // centre: it must stay put.
@@ -650,6 +677,13 @@ fn collect(board: &Board, free_vias: bool) -> (Vec<Wire>, Vec<Blob>, usize, Vec<
         }
     }
     (wires, blobs, joints, vias)
+}
+
+pub(crate) fn area_border(area: &copper_geometry::Area) -> Vec<FloatPoint> {
+    match area {
+        copper_geometry::Area::Polyline(pa) => pa.get_border().as_ops().corner_approx_arr(),
+        copper_geometry::Area::Shape(shape) => shape.corner_approx_arr(),
+    }
 }
 
 fn note(pairs: &mut BTreeMap<NetPair, f64>, key: &NetPair, distance: f64) {

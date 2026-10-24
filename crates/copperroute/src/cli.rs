@@ -484,6 +484,13 @@ pub struct ReshapeArgs {
     /// together by this fraction of its length before the clearances push back. 0 is no pull.
     #[arg(long, default_value_t = 0.0)]
     pub tension: f64,
+    /// After the traces relax, this many more rounds with the vias free too.
+    #[arg(long, default_value_t = 0)]
+    pub via_relax: usize,
+    /// Stop after the first step that leaves more than this many new violations, naming where
+    /// they are, and write the session of that step.
+    #[arg(long)]
+    pub stop_at: Option<i64>,
     /// The router backend for the repair reroute.
     #[arg(long, default_value = "grid")]
     pub repair_backend: String,

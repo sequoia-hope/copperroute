@@ -105,9 +105,10 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
     }
 
     let mut outline: Vec<FloatPoint> = plan.board_outline.iter().map(to_board).collect();
-    let tolerated = copper_morph::relax_clearance(board, 0, Some(&outline), &BTreeMap::new(), 0.0, false).close_pairs;
     let mut applied: BTreeMap<i32, [f64; 3]> = BTreeMap::new();
     let pause = copper_morph::frames::pause();
+    let mut reached = 0;
+    let mut open_nets: BTreeSet<(i32, usize)> = BTreeSet::new();
     for (k, step) in plan.steps.iter().enumerate().take(last + 1) {
         let started = std::time::Instant::now();
         let target: Vec<FloatPoint> = step.outline.iter().map(to_board).collect();
@@ -133,13 +134,17 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
         let report = reshape_step(board, &outline, &target, &moves, args.cell_mm, &pair_nets);
         outline = target;
         if args.relax > 0 {
-            let r = copper_morph::relax_clearance(board, args.relax, Some(&outline), &tolerated, args.tension, false);
+            let r = copper_morph::relax_clearance(board, args.relax, Some(&outline), &BTreeMap::new(), args.tension, false);
             tracing::info!(
                 "step {k}: relaxed {} traces, overlaps {} -> {}",
                 r.traces_moved,
                 r.overlaps_before,
                 r.overlaps_after
             );
+        }
+        if args.via_relax > 0 {
+            let r = copper_morph::relax_clearance(board, args.via_relax, Some(&outline), &BTreeMap::new(), args.tension, true);
+            tracing::info!("step {k}: {} vias moved, overlaps {} -> {}", r.vias_moved, r.overlaps_before, r.overlaps_after);
         }
         let due = if args.repair_at_keyframes {
             !step.label.contains('→')
@@ -152,7 +157,24 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
             0
         };
         let seconds = started.elapsed().as_secs_f64();
-        let open = copper_drc::all_airlines(board).len();
+        let airlines = copper_drc::all_airlines(board);
+        let open = airlines.len();
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let nets: BTreeSet<i32> = airlines.iter().map(|a| a.net_number).collect();
+            for a in airlines.iter().filter(|a| !open_nets.contains(&(a.net_number, open_count(&airlines, a.net_number)))) {
+                tracing::debug!(
+                    "step {k}: open {} {:?} at ({:.0}, {:.0}) - {:?} at ({:.0}, {:.0})",
+                    board.rules.nets.get(a.net_number).map_or(String::new(), |n| n.name.clone()),
+                    board.get_item(a.from_item).map(Item::kind),
+                    a.from_corner.x,
+                    a.from_corner.y,
+                    board.get_item(a.to_item).map(Item::kind),
+                    a.to_corner.x,
+                    a.to_corner.y
+                );
+            }
+            open_nets = nets.iter().map(|n| (*n, open_count(&airlines, *n))).collect();
+        }
         tracing::info!(
             "step {k} ({}): {} parts, {} traces, {} vias, {} areas; {ripped} ripped; {open} open; {seconds:.1} s",
             step.label,
@@ -161,23 +183,34 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
             report.vias,
             report.areas
         );
+        let mut stats = step_stats(&step.label, board, &baseline, open, seconds);
+        stats["ripped"] = serde_json::json!(ripped);
+        stats["pairs"] = pair_metrics(board, &pairs, per_mm);
+        let new = stats["new violations"].as_i64().unwrap_or(0);
         if let Some(r) = &recording {
-            let mut stats = step_stats(&step.label, board, &baseline, open, seconds);
-            stats["ripped"] = serde_json::json!(ripped);
-            stats["pairs"] = pair_metrics(board, &pairs, per_mm);
-            r.writer.borrow_mut().write_with(
-                board,
-                &["reshape", &step.label],
-                &[],
-                &IntVector::ZERO,
-                stats,
-            );
+            r.writer.borrow_mut().write_with(board, &["reshape", &step.label], &[], &IntVector::ZERO, stats);
+        }
+        reached = k;
+        if args.stop_at.is_some_and(|limit| new > limit) {
+            tracing::warn!("step {k} ({}): {new} new violations, past --stop-at; stopping here", step.label);
+            for id in new_violation_items(board, &allowed).into_iter().take(STOP_REPORT) {
+                let at = board.get_bounding_box_of_items([id]);
+                let item = board.get_item(id);
+                tracing::warn!(
+                    "  {:?} of {:?} at ({:.2}, {:.2}) mm",
+                    item.map(Item::kind),
+                    item.map(|i| i.net_nos().iter().filter_map(|n| board.rules.nets.get(*n).map(|net| net.name.clone())).collect::<Vec<_>>()),
+                    (f64::from(at.ll.x + at.ur.x) / 2.0 / per_mm + base_x * scale / per_mm),
+                    (f64::from(at.ll.y + at.ur.y) / 2.0 / per_mm + base_y * scale / per_mm),
+                );
+            }
+            break;
         }
     }
     drop(pause);
 
-    let outline_mm: Vec<[f64; 2]> = plan.steps[last].outline.clone();
-    let text = serde_json::json!({ "step": last, "label": plan.steps[last].label, "outline_mm": outline_mm });
+    let outline_mm: Vec<[f64; 2]> = plan.steps[reached].outline.clone();
+    let text = serde_json::json!({ "step": reached, "label": plan.steps[reached].label, "outline_mm": outline_mm });
     if let Err(error) = write_routed(&mut loaded, &original, &args.output)
         .and_then(|()| std::fs::write(args.output.with_extension("outline.json"), text.to_string()).map_err(|e| e.to_string()))
     {
@@ -250,6 +283,10 @@ pub(super) fn write_routed(
         .map_err(|e| e.to_string())?;
     std::fs::write(output, &bytes).map_err(|e| e.to_string())?;
     fixed_wiring::write_sidecar(output, &superseded).map_err(|e| e.to_string())
+}
+
+fn open_count(airlines: &[copper_drc::AirLine], net: i32) -> usize {
+    airlines.iter().filter(|a| a.net_number == net).count()
 }
 
 pub(super) fn violation_counts(board: &mut Board) -> BTreeMap<String, usize> {
@@ -339,6 +376,8 @@ fn diff_pairs(board: &Board) -> Vec<(String, String)> {
 }
 
 const SIMPLIFY_MM: f64 = 0.01;
+/// How many of the violations that stop a reshape it names.
+const STOP_REPORT: usize = 15;
 const OPT_CHANGED_AREA_MS: i32 = 1000;
 
 /// The items in violations beyond `allowed`, counted per kind and net pair, in the checker's order.

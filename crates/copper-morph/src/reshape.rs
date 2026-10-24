@@ -78,6 +78,14 @@ pub fn reshape_step(
 
     let lifted = lift_traces(board, per_mm);
     report.traces = lifted.len();
+    let owners = pour_owners(board);
+    let attached = attachments(board, &owners, moves);
+    let carry = |p: &FloatPoint, layer: Option<usize>, nets: &[i32]| -> Option<IntPoint> {
+        attached
+            .iter()
+            .find(|a| layer.is_none_or(|l| l == a.layer) && a.nets.iter().any(|n| nets.contains(n)) && crate::relax::inside(&a.border, p))
+            .map(|a| a.carry(p))
+    };
 
     for (&component, part) in moves {
         let Some(Point::Int(location)) = board
@@ -88,7 +96,8 @@ pub fn reshape_step(
         else {
             continue;
         };
-        let items = board.get_component_items(component);
+        let mut items = board.get_component_items(component);
+        items.extend(owners.iter().filter(|(_, c)| **c == component).map(|(pour, _)| *pour));
         if part.turn_degree != 0.0 {
             board.components.rotate(component, part.turn_degree, &location);
             for &id in &items {
@@ -163,7 +172,7 @@ pub fn reshape_step(
         let Some(Point::Int(old)) = board.drill_center(id) else {
             continue;
         };
-        let new = snaps.get(&(old.x, old.y)).copied().unwrap_or_else(|| {
+        let new = snaps.get(&(old.x, old.y)).copied().or_else(|| carry(&old.to_float(), None, &nets)).unwrap_or_else(|| {
             let (dx, dy) = field.displacement(&pair_point(&nets, None, &old.to_float()));
             IntPoint::new(old.x + dx.round() as i32, old.y + dy.round() as i32)
         });
@@ -182,6 +191,7 @@ pub fn reshape_step(
                     item,
                     Item::ObstacleArea(_) | Item::ViaObstacleArea(_) | Item::ConductionArea(_)
                 )
+                && !owners.contains_key(&item.id())
         })
         .map(Item::id)
         .collect();
@@ -217,7 +227,7 @@ pub fn reshape_step(
         let mut points: Vec<Point> = Vec::with_capacity(trace.corners.len());
         for c in &trace.corners {
             let key = (c.x.round() as i32, c.y.round() as i32);
-            let p = snaps.get(&key).copied().unwrap_or_else(|| {
+            let p = snaps.get(&key).copied().or_else(|| carry(c, Some(trace.layer), &trace.nets)).unwrap_or_else(|| {
                 let (dx, dy) = field.displacement(&pair_point(&trace.nets, Some(trace.layer), c));
                 IntPoint::new((c.x + dx).round() as i32, (c.y + dy).round() as i32)
             });
@@ -276,6 +286,93 @@ fn edge_contact(parts_only: &WarpField, old: &FloatPoint, to: &[FloatPoint]) -> 
     }
     let edge = nearest_on_polygon(to, &carried);
     (edge.x - old.x, edge.y - old.y)
+}
+
+/// Each pour that some part's pads touch, with the part touching it with most pads. The pour
+/// moves rigidly with that part; the planner keeps every part on a pour in one rigid island, so
+/// they all move alike and no pad comes off.
+fn pour_owners(board: &Board) -> BTreeMap<ItemId, i32> {
+    let ctx = board.ctx();
+    let mut owners = BTreeMap::new();
+    for item in board.get_items() {
+        let Item::ConductionArea(area) = item else {
+            continue;
+        };
+        if item.component_id() > 0 {
+            continue;
+        }
+        let border = crate::relax::area_border(area.get_area(&ctx));
+        let layer = item.first_layer(&ctx);
+        let mut pads: BTreeMap<i32, usize> = BTreeMap::new();
+        for pin in board.get_items() {
+            if !pin.is_drill_item()
+                || pin.component_id() <= 0
+                || !pin.net_nos().iter().any(|n| item.net_nos().contains(n))
+                || !(pin.first_layer(&ctx)..=pin.last_layer(&ctx)).contains(&layer)
+            {
+                continue;
+            }
+            let touches = (0..pin.tile_shape_count(&ctx)).any(|i| {
+                board.item_tile_shape_ref(pin.id(), i).is_some_and(|shape| {
+                    let pad = shape.corner_approx_arr();
+                    pad.iter().any(|p| crate::relax::inside(&border, p)) || border.iter().any(|p| crate::relax::inside(&pad, p))
+                })
+            });
+            if touches {
+                *pads.entry(pin.component_id()).or_insert(0) += 1;
+            }
+        }
+        if let Some((component, _)) = pads.into_iter().max_by_key(|(_, n)| *n) {
+            owners.insert(item.id(), component);
+        }
+    }
+    owners
+}
+
+/// A pour as it was before the step, and its part's rigid move.
+struct Attachment {
+    border: Vec<FloatPoint>,
+    layer: usize,
+    nets: Vec<i32>,
+    pole: FloatPoint,
+    turn: (f64, f64),
+    by: (f64, f64),
+}
+
+impl Attachment {
+    fn carry(&self, p: &FloatPoint) -> IntPoint {
+        let (s, c) = self.turn;
+        let (rx, ry) = (p.x - self.pole.x, p.y - self.pole.y);
+        IntPoint::new(
+            (self.pole.x + rx * c - ry * s + self.by.0).round() as i32,
+            (self.pole.y + rx * s + ry * c + self.by.1).round() as i32,
+        )
+    }
+}
+
+/// Vias and trace corners inside a pour go where the pour goes.
+fn attachments(board: &Board, owners: &BTreeMap<ItemId, i32>, moves: &BTreeMap<i32, PartMove>) -> Vec<Attachment> {
+    let ctx = board.ctx();
+    let still = PartMove::default();
+    owners
+        .iter()
+        .filter_map(|(pour, component)| {
+            let item = board.get_item(*pour)?;
+            let Item::ConductionArea(area) = item else {
+                return None;
+            };
+            let pole = board.components.get_all().find(|c| c.id == *component)?.get_location()?.to_float();
+            let part = moves.get(component).unwrap_or(&still);
+            Some(Attachment {
+                border: crate::relax::area_border(area.get_area(&ctx)),
+                layer: item.first_layer(&ctx),
+                nets: item.net_nos().to_vec(),
+                pole,
+                turn: part.turn_degree.to_radians().sin_cos(),
+                by: part.by,
+            })
+        })
+        .collect()
 }
 
 /// Each pin of every part: its id, centre now, and centre after the part's rigid move (none for

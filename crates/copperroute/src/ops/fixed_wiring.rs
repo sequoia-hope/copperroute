@@ -148,21 +148,27 @@ pub fn write_sidecar(session: &Path, superseded: &[Superseded]) -> std::io::Resu
     std::fs::write(path, text)
 }
 
-/// Removes the design's fixed items a sidecar lists. Returns how many were found and removed.
+/// Removes the design's fixed items a sidecar lists, every copy of each. Returns how many of the
+/// listed items were found.
 fn remove_superseded(board: &mut Board, superseded: &[Superseded]) -> usize {
     let wanted: BTreeSet<&Wiring> = superseded.iter().map(|s| &s.wiring).collect();
-    let doomed: Vec<ItemId> = board
-        .get_items()
-        .filter(|item| signature(board, item).is_some_and(|s| wanted.contains(&s)))
-        .map(Item::id)
-        .collect();
+    let mut found = BTreeSet::new();
+    let mut doomed = Vec::new();
+    for item in board.get_items() {
+        if let Some(s) = signature(board, item)
+            && wanted.contains(&s)
+        {
+            doomed.push(item.id());
+            found.insert(s);
+        }
+    }
     for &id in &doomed {
         if let Some(item) = board.get_item_mut(id) {
             item.set_fixed_state(FixedState::Unfixed);
         }
         board.remove_item(id);
     }
-    doomed.len()
+    found.len()
 }
 
 /// Removes what the sidecar beside `session` supersedes, if there is one.
