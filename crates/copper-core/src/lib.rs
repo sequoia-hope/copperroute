@@ -9,6 +9,8 @@ pub mod load;
 pub mod manifest;
 #[cfg(feature = "gpu")]
 pub mod grid_backend;
+#[cfg(feature = "gpu")]
+pub mod topo_backend;
 pub mod nudge;
 pub mod pipeline;
 pub mod preview;

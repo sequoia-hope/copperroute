@@ -84,11 +84,12 @@ pub const DEFAULT_BACKEND: &str = "maze";
 static BACKENDS: [&dyn RouterBackend; 3] =
     [&MazeBackend, &NoneBackend, &crate::nudge::NudgeBackend];
 #[cfg(feature = "gpu")]
-static BACKENDS: [&dyn RouterBackend; 4] = [
+static BACKENDS: [&dyn RouterBackend; 5] = [
     &MazeBackend,
     &NoneBackend,
     &crate::nudge::NudgeBackend,
     &crate::grid_backend::GridBackend,
+    &crate::topo_backend::TopoBackend,
 ];
 
 pub fn backends() -> &'static [&'static dyn RouterBackend] {

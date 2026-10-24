@@ -18,6 +18,9 @@ struct Plan {
     board_outline: Vec<[f64; 2]>,
     view: Option<[f64; 4]>,
     steps: Vec<PlanStep>,
+    /// Parts that move as one rigid body.
+    #[serde(default)]
+    bodies: Vec<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -64,6 +67,29 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
         .get_all()
         .map(|c| (c.name.clone(), c.id))
         .collect();
+    let names: BTreeMap<i32, String> = ids.iter().map(|(name, id)| (*id, name.clone())).collect();
+    let locked: BTreeSet<i32> = args.lock.iter().filter_map(|name| ids.get(name).copied()).collect();
+    if let Some(name) = args.lock.iter().find(|name| !ids.contains_key(*name)) {
+        tracing::error!("--lock {name}: no such part");
+        return ExitCode::UsageError;
+    }
+    let mut bodies: Vec<Vec<i32>> = plan
+        .bodies
+        .iter()
+        .map(|body| body.iter().filter_map(|name| ids.get(name).copied()).collect())
+        .collect();
+    let mut body_of: BTreeMap<i32, usize> = BTreeMap::new();
+    for (b, body) in bodies.iter().enumerate() {
+        for part in body {
+            body_of.insert(*part, b);
+        }
+    }
+    for id in ids.values() {
+        body_of.entry(*id).or_insert_with(|| {
+            bodies.push(vec![*id]);
+            bodies.len() - 1
+        });
+    }
 
     let mut recording = None;
     if let Some(dir) = &args.frames {
@@ -83,8 +109,8 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
     let baseline = violation_counts(board);
     let start_open = copper_drc::all_airlines(board).len();
     let mut allowed: BTreeMap<ViolationKey, usize> = BTreeMap::new();
-    for (key, _, _) in violation_keys(board) {
-        *allowed.entry(key).or_insert(0) += 1;
+    for found in violation_keys(board) {
+        *allowed.entry(found.key).or_insert(0) += 1;
     }
     let pairs = diff_pairs(board);
     let protected: BTreeSet<i32> = pairs
@@ -100,6 +126,7 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
         .collect();
     if let Some(r) = &recording {
         let mut stats = step_stats("start", board, &baseline, start_open, 0.0);
+        stats["errors"] = error_marks(board, &allowed);
         stats["pairs"] = pair_metrics(board, &pairs, per_mm);
         r.writer.borrow_mut().write_with(board, &["start"], &[], &IntVector::ZERO, stats);
     }
@@ -133,18 +160,32 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
         }
         let report = reshape_step(board, &outline, &target, &moves, args.cell_mm, &pair_nets);
         outline = target;
-        if args.relax > 0 {
-            let r = copper_morph::relax_clearance(board, args.relax, Some(&outline), &BTreeMap::new(), args.tension, false);
-            tracing::info!(
-                "step {k}: relaxed {} traces, overlaps {} -> {}",
-                r.traces_moved,
-                r.overlaps_before,
-                r.overlaps_after
-            );
-        }
-        if args.via_relax > 0 {
-            let r = copper_morph::relax_clearance(board, args.via_relax, Some(&outline), &BTreeMap::new(), args.tension, true);
-            tracing::info!("step {k}: {} vias moved, overlaps {} -> {}", r.vias_moved, r.overlaps_before, r.overlaps_after);
+        let pressed = relax(board, args, &outline, k);
+        if args.nudge_mm > 0.0 {
+            let mut pushes: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
+            for (part, (x, y)) in pressed {
+                let p = pushes.entry(body_of[&part]).or_default();
+                p.0 += x;
+                p.1 += y;
+            }
+            let mut nudges = BTreeMap::new();
+            for (body, (x, y)) in pushes {
+                let parts = &bodies[body];
+                let len = x.hypot(y);
+                if parts.iter().any(|p| locked.contains(p)) || len < NUDGE_MIN_MM * per_mm {
+                    continue;
+                }
+                let scale = len.min(args.nudge_mm * per_mm) / len;
+                for &part in parts {
+                    nudges.insert(part, PartMove { by: (x * scale, y * scale), turn_degree: 0.0 });
+                }
+            }
+            if !nudges.is_empty() {
+                let names: Vec<&str> = nudges.keys().filter_map(|id| names.get(id).map(String::as_str)).collect();
+                tracing::info!("step {k}: nudging {names:?}");
+                copper_morph::nudge_parts(board, &outline, &nudges, args.cell_mm, &pair_nets);
+                relax(board, args, &outline, k);
+            }
         }
         let due = if args.repair_at_keyframes {
             !step.label.contains('→')
@@ -152,7 +193,11 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
             args.repair_every > 0 && (k % args.repair_every == args.repair_every - 1 || k == last)
         };
         let ripped = if due {
-            repair(board, &allowed, &protected, &loaded.settings, args.repair_ms, backend)
+            if args.reroute {
+                reroute(board, &loaded.settings, args.repair_ms, backend, args.rip_design_wiring)
+            } else {
+                repair(board, &allowed, &protected, &loaded.settings, args.repair_ms, backend)
+            }
         } else {
             0
         };
@@ -184,6 +229,7 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
             report.areas
         );
         let mut stats = step_stats(&step.label, board, &baseline, open, seconds);
+        stats["errors"] = error_marks(board, &allowed);
         stats["ripped"] = serde_json::json!(ripped);
         stats["pairs"] = pair_metrics(board, &pairs, per_mm);
         let new = stats["new violations"].as_i64().unwrap_or(0);
@@ -218,6 +264,28 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
         return ExitCode::Failure;
     }
     ExitCode::Ok
+}
+
+/// The trace relaxation and then the via relaxation, as asked; returns what the copper still
+/// presses on the pads after the last of them.
+fn relax(board: &mut Board, args: &ReshapeArgs, outline: &[FloatPoint], k: usize) -> BTreeMap<i32, (f64, f64)> {
+    let mut pressed = BTreeMap::new();
+    if args.relax > 0 {
+        let r = copper_morph::relax_clearance(board, args.relax, Some(outline), &BTreeMap::new(), args.tension, false);
+        tracing::info!(
+            "step {k}: relaxed {} traces, overlaps {} -> {}",
+            r.traces_moved,
+            r.overlaps_before,
+            r.overlaps_after
+        );
+        pressed = r.part_push;
+    }
+    if args.via_relax > 0 {
+        let r = copper_morph::relax_clearance(board, args.via_relax, Some(outline), &BTreeMap::new(), args.tension, true);
+        tracing::info!("step {k}: {} vias moved, overlaps {} -> {}", r.vias_moved, r.overlaps_before, r.overlaps_after);
+        pressed = r.part_push;
+    }
+    pressed
 }
 
 /// Loads a board with a routed session on it, the session's routing unfixed so it can move.
@@ -330,7 +398,15 @@ pub(super) fn step_stats(
 /// What a violation is between, not where: kind and the nets on each side.
 pub(super) type ViolationKey = (String, Vec<String>);
 
-pub(super) fn violation_keys(board: &mut Board) -> Vec<(ViolationKey, ItemId, Option<ItemId>)> {
+pub(super) struct Found {
+    pub key: ViolationKey,
+    pub first: ItemId,
+    pub second: Option<ItemId>,
+    pub position: FloatPoint,
+    pub layer: Option<usize>,
+}
+
+pub(super) fn violation_keys(board: &mut Board) -> Vec<Found> {
     let net_names = |board: &Board, id: Option<ItemId>| -> String {
         id.and_then(|id| board.get_item(id))
             .map(|item| {
@@ -350,7 +426,7 @@ pub(super) fn violation_keys(board: &mut Board) -> Vec<(ViolationKey, ItemId, Op
             let kind = kind.split(['(', ' ', '{']).next().unwrap_or_default().to_lowercase();
             let mut nets = vec![net_names(board, Some(v.first_item)), net_names(board, v.second_item)];
             nets.sort();
-            ((kind, nets), v.first_item, v.second_item)
+            Found { key: (kind, nets), first: v.first_item, second: v.second_item, position: v.position, layer: v.layer }
         })
         .collect()
 }
@@ -378,18 +454,42 @@ fn diff_pairs(board: &Board) -> Vec<(String, String)> {
 const SIMPLIFY_MM: f64 = 0.01;
 /// How many of the violations that stop a reshape it names.
 const STOP_REPORT: usize = 15;
+/// Smaller pushes are pads lying snug against copper, not pads pressed into it.
+const NUDGE_MIN_MM: f64 = 0.02;
 const OPT_CHANGED_AREA_MS: i32 = 1000;
 
-/// The items in violations beyond `allowed`, counted per kind and net pair, in the checker's order.
-pub(super) fn new_violation_items(board: &mut Board, allowed: &BTreeMap<ViolationKey, usize>) -> Vec<ItemId> {
+/// The violations beyond `allowed`, counted per kind and net pair, in the checker's order.
+pub(super) fn new_violations(board: &mut Board, allowed: &BTreeMap<ViolationKey, usize>) -> Vec<Found> {
     let mut seen: BTreeMap<ViolationKey, usize> = BTreeMap::new();
+    violation_keys(board)
+        .into_iter()
+        .filter(|found| {
+            let count = seen.entry(found.key.clone()).or_insert(0);
+            *count += 1;
+            *count > allowed.get(&found.key).copied().unwrap_or(0)
+        })
+        .collect()
+}
+
+/// Where each new violation is, for the viewer: kind, nets, SVG position (y flipped) and layer.
+pub(super) fn error_marks(board: &mut Board, allowed: &BTreeMap<ViolationKey, usize>) -> serde_json::Value {
+    new_violations(board, allowed)
+        .into_iter()
+        .map(|f| {
+            serde_json::json!({
+                "kind": f.key.0,
+                "nets": f.key.1,
+                "at": [f.position.x.round(), (-f.position.y).round()],
+                "layer": f.layer,
+            })
+        })
+        .collect()
+}
+
+/// The items in violations beyond `allowed`, in the checker's order.
+pub(super) fn new_violation_items(board: &mut Board, allowed: &BTreeMap<ViolationKey, usize>) -> Vec<ItemId> {
     let mut items = Vec::new();
-    for (key, first, second) in violation_keys(board) {
-        let count = seen.entry(key.clone()).or_insert(0);
-        *count += 1;
-        if *count <= allowed.get(&key).copied().unwrap_or(0) {
-            continue;
-        }
+    for Found { key, first, second, .. } in new_violations(board, allowed) {
         tracing::debug!(
             "new {key:?} between {:?} and {:?}",
             board.get_item(first).map(Item::kind),
@@ -464,6 +564,61 @@ fn repair(
             ),
             Err(error) => tracing::warn!("repair reroute: {error}"),
         }
+    }
+    doomed.len()
+}
+
+/// Rips every trace and via the design didn't fix (all of them with `design_too`) and routes the
+/// board again, with the optimizer. Returns how many items were ripped.
+fn reroute(
+    board: &mut Board,
+    settings: &copper_settings::RouterSettings,
+    deadline_ms: i32,
+    backend: &'static dyn copper_core::RouterBackend,
+    design_too: bool,
+) -> usize {
+    let doomed: Vec<ItemId> = board
+        .get_items()
+        .filter(|i| {
+            (i.is_trace() || matches!(i, Item::Via(_)))
+                && (design_too || i.get_fixed_state() < copper_board::structure::FixedState::SystemFixed)
+        })
+        .map(Item::id)
+        .collect();
+    for &id in &doomed {
+        if let Some(item) = board.get_item_mut(id) {
+            item.set_fixed_state(copper_board::structure::FixedState::Unfixed);
+        }
+        board.remove_item(id);
+    }
+    let mut settings = settings.clone();
+    if settings.opt_changed_area_ms.unwrap_or(0) <= 0 {
+        settings.opt_changed_area_ms = Some(OPT_CHANGED_AREA_MS);
+    }
+    let started = std::time::Instant::now();
+    let progress = copper_core::SyncProgressSink::new(move |event| {
+        tracing::debug!("reroute {:.1} s: {event:?}", started.elapsed().as_secs_f64());
+    });
+    let ctx = copper_core::Ctx {
+        settings: &settings,
+        cancel: copper_core::CancelToken::with_timeout(std::time::Duration::from_millis(
+            u64::try_from(deadline_ms).unwrap_or(0),
+        )),
+        progress: &progress,
+        budget: crate::ops::route::budget_for(&settings),
+        backend,
+    };
+    let open_before = copper_drc::all_airlines(board).len();
+    match copper_core::RoutingPipeline::run(board, &ctx) {
+        Ok(result) => tracing::info!(
+            "reroute: {} items ripped, {open_before} airlines before, {} after; {} passes, timed out {}, {:.0} s",
+            doomed.len(),
+            copper_drc::all_airlines(board).len(),
+            result.pipeline.router_passes_completed,
+            result.timed_out,
+            started.elapsed().as_secs_f64()
+        ),
+        Err(error) => tracing::warn!("reroute: {error}"),
     }
     doomed.len()
 }

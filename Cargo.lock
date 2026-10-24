@@ -255,6 +255,7 @@ dependencies = [
  "copper-morph",
  "copper-router",
  "copper-settings",
+ "copper-topo",
  "serde",
  "serde_json",
  "testkit",
@@ -356,6 +357,18 @@ dependencies = [
  "serde_json",
  "testkit",
  "thiserror",
+]
+
+[[package]]
+name = "copper-topo"
+version = "0.1.0"
+dependencies = [
+ "copper-board",
+ "copper-drc",
+ "copper-geometry",
+ "copper-gpu",
+ "spade",
+ "tracing",
 ]
 
 [[package]]
@@ -1044,6 +1057,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
+name = "robust"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e27ee8bb91ca0adcf0ecb116293afa12d393f9c2b9b9cd54d33e8078fe19839"
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1158,6 +1177,18 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+
+[[package]]
+name = "spade"
+version = "2.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9699399fd9349b00b184f5635b074f9ec93afffef30c853f8c875b32c0f8c7fa"
+dependencies = [
+ "hashbrown 0.16.1",
+ "num-traits",
+ "robust",
+ "smallvec",
+]
 
 [[package]]
 name = "spirv"

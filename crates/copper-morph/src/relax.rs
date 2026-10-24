@@ -19,6 +19,8 @@ pub struct RelaxReport {
     /// The net pairs found too close before relaxing, the edge as net -1, with the smallest
     /// distance between them.
     pub close_pairs: BTreeMap<NetPair, f64>,
+    /// What the copper still pushes on each part's pads after the last round.
+    pub part_push: BTreeMap<i32, (f64, f64)>,
 }
 
 pub type NetPair = (Vec<i32>, Vec<i32>);
@@ -57,9 +59,11 @@ struct Blob {
     class: usize,
     polygon: Vec<FloatPoint>,
     centre: FloatPoint,
-    /// Touches a pour of its own net, which a refill keeps the zone clearance from other nets'
-    /// copper: crowd it and the pour's neck to this pad is cut.
-    fed: bool,
+    /// The part whose pad this is, 0 for a via.
+    part: i32,
+    /// The pour of its own net it touches, which a refill keeps the zone clearance from other
+    /// nets' copper: crowd it and the pour's neck to this pad is cut.
+    pour: Option<usize>,
 }
 
 struct ViaNode {
@@ -130,6 +134,7 @@ pub fn relax_clearance(
             }
         }
         let mut via_push = vec![(0.0, 0.0); joints];
+        let mut reaction: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
         let mut segment_cells: HashMap<(i64, i64, usize), Vec<(usize, usize)>> = HashMap::new();
         for (w, wire) in wires.iter().enumerate() {
             for s in 0..wire.points.len().saturating_sub(1) {
@@ -194,7 +199,7 @@ pub fn relax_clearance(
                         continue;
                     }
                     let clearance = f64::from(board.clearance_value(wire.class, blob.class, wire.layer));
-                    let need = wire.half + if blob.fed { clearance.max(zone) } else { clearance } + slack;
+                    let need = wire.half + if blob.pour.is_some() { clearance.max(zone) } else { clearance } + slack;
                     let (d, ta, pa, pb) = to_polygon(a0, a1, polygon(b));
                     if d >= need {
                         continue;
@@ -222,7 +227,12 @@ pub fn relax_clearance(
                             via_push[vias[v].joint].0 -= n.0 * depth / 2.0;
                             via_push[vias[v].joint].1 -= n.1 * depth / 2.0;
                         }
-                        None => add(&mut push[w], s, ta, n, depth),
+                        None => {
+                            add(&mut push[w], s, ta, n, depth);
+                            let r = reaction.entry(b).or_default();
+                            r.0 -= n.0 * depth;
+                            r.1 -= n.1 * depth;
+                        }
                     }
                 }
             }
@@ -269,7 +279,14 @@ pub fn relax_clearance(
                     let len = dx.hypot(dy).max(1.0);
                     ((dx / len, dy / len), need)
                 };
-                let share = if other.via.is_some() { 0.5 } else { 1.0 };
+                let share = if other.via.is_some() {
+                    0.5
+                } else {
+                    let r = reaction.entry(o).or_default();
+                    r.0 -= n.0 * depth;
+                    r.1 -= n.1 * depth;
+                    1.0
+                };
                 via_push[vias[v].joint].0 += n.0 * depth * share;
                 via_push[vias[v].joint].1 += n.1 * depth * share;
             }
@@ -308,6 +325,14 @@ pub fn relax_clearance(
             report.overlaps_before = overlaps;
         }
         report.overlaps_after = overlaps;
+        report.part_push = BTreeMap::new();
+        for (b, (x, y)) in &reaction {
+            if blobs[*b].part > 0 {
+                let p = report.part_push.entry(blobs[*b].part).or_default();
+                p.0 += x;
+                p.1 += y;
+            }
+        }
         if round == total || (overlaps == 0 && round >= pulling) {
             break;
         }
@@ -617,7 +642,8 @@ fn collect(board: &Board, free_vias: bool) -> (Vec<Wire>, Vec<Blob>, usize, Vec<
                         polygon.iter().map(|p| p.y).sum::<f64>() / n,
                     );
                     blobs.push(Blob {
-                        fed: false,
+                        part: item.component_id(),
+                        pour: None,
                         via,
                         layer: first + i,
                         nets: item.net_nos().to_vec(),
@@ -640,7 +666,7 @@ fn collect(board: &Board, free_vias: bool) -> (Vec<Wire>, Vec<Blob>, usize, Vec<
         }
     }
     for blob in &mut blobs {
-        blob.fed = pours.iter().any(|(l, n, border)| {
+        blob.pour = pours.iter().position(|(l, n, border)| {
             *l == blob.layer
                 && n.iter().any(|x| blob.nets.contains(x))
                 && (blob.polygon.iter().any(|p| inside(border, p)) || border.iter().any(|p| inside(&blob.polygon, p)))

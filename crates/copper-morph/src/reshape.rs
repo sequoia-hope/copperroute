@@ -49,6 +49,29 @@ pub fn reshape_step(
     cell_mm: f64,
     pairs: &[(i32, i32)],
 ) -> ReshapeReport {
+    step(board, from, to, moves, cell_mm, pairs, false)
+}
+
+/// Moves parts within an outline that stays put, carrying their copper as a step does.
+pub fn nudge_parts(
+    board: &mut Board,
+    outline: &[FloatPoint],
+    moves: &BTreeMap<i32, PartMove>,
+    cell_mm: f64,
+    pairs: &[(i32, i32)],
+) -> ReshapeReport {
+    step(board, outline, outline, moves, cell_mm, pairs, true)
+}
+
+fn step(
+    board: &mut Board,
+    from: &[FloatPoint],
+    to: &[FloatPoint],
+    moves: &BTreeMap<i32, PartMove>,
+    cell_mm: f64,
+    pairs: &[(i32, i32)],
+    edge_held: bool,
+) -> ReshapeReport {
     let per_mm = board.communication.get_resolution(Unit::Mm);
     let mut report = ReshapeReport::default();
 
@@ -69,7 +92,8 @@ pub fn reshape_step(
     let mut field = WarpField::new(&bounds, cell_mm * per_mm, MARGIN_MM * per_mm);
     for old in from {
         let at = IntPoint::new(old.x.round() as i32, old.y.round() as i32);
-        field.add_inclusion(&[square(at, pin)], edge_contact(&parts_only, old, to), false);
+        let edge = if edge_held { (0.0, 0.0) } else { edge_contact(&parts_only, old, to) };
+        field.add_inclusion(&[square(at, pin)], edge, false);
     }
     for (shapes, vector) in pads {
         field.add_inclusion(&shapes, vector, false);

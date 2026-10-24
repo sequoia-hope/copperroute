@@ -16,8 +16,8 @@ pub fn run(cli: &Cli, args: &BandArgs) -> ExitCode {
     let per_mm = board.communication.get_resolution(Unit::Mm);
     let baseline = super::reshape::violation_counts(board);
     let mut allowed = BTreeMap::new();
-    for (key, _, _) in super::reshape::violation_keys(board) {
-        *allowed.entry(key).or_insert(0usize) += 1;
+    for found in super::reshape::violation_keys(board) {
+        *allowed.entry(found.key).or_insert(0usize) += 1;
     }
     let split = copper_morph::subdivide_traces(board, args.segment_mm * per_mm);
     tracing::info!("{split} traces subdivided to {} mm", args.segment_mm);
@@ -38,6 +38,7 @@ pub fn run(cli: &Cli, args: &BandArgs) -> ExitCode {
         let open = copper_drc::all_airlines(board).len();
         let mut stats = super::reshape::step_stats(label, board, &baseline, open, 0.0);
         stats["rounds"] = serde_json::json!(rounds);
+        stats["errors"] = super::reshape::error_marks(board, &allowed);
         stats["copper length mm"] = serde_json::json!((copper_length(board) / per_mm * 10.0).round() / 10.0);
         tracing::info!("{label} after {rounds} rounds: {stats}");
         if let Some(r) = &recording {

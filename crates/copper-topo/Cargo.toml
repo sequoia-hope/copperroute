@@ -1,0 +1,13 @@
+[package]
+name = "copper-topo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+copper-board = { path = "../copper-board" }
+copper-drc = { path = "../copper-drc" }
+copper-geometry = { path = "../copper-geometry" }
+copper-gpu = { path = "../copper-gpu" }
+spade = "2.15.1"
+tracing.workspace = true

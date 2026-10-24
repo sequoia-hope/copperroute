@@ -17,16 +17,16 @@ fn points(ps: &[FloatPoint]) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
-fn shape_svg(shape: &Shape, fill: &str, opacity: f64) -> String {
+fn shape_svg(shape: &Shape, fill: &str, opacity: f64, layer: &str) -> String {
     match shape {
         Shape::Circle(c) => format!(
-            r#"<circle cx="{}" cy="{}" r="{}" fill="{fill}" opacity="{opacity}"/>"#,
+            r#"<circle class="{layer}" cx="{}" cy="{}" r="{}" fill="{fill}" opacity="{opacity}"/>"#,
             c.center.x,
             -f64::from(c.center.y),
             c.radius
         ),
         _ => format!(
-            r#"<polygon points="{}" fill="{fill}" opacity="{opacity}"/>"#,
+            r#"<polygon class="{layer}" points="{}" fill="{fill}" opacity="{opacity}"/>"#,
             points(&shape.corner_approx_arr())
         ),
     }
@@ -75,7 +75,8 @@ pub fn board_svg_in(
             }
             Item::Trace(trace) => {
                 out.push_str(&format!(
-                    r#"<polyline points="{}" fill="none" stroke="{}" stroke-width="{}" stroke-linecap="round" stroke-linejoin="round"/>"#,
+                    r#"<polyline class="l{}" points="{}" fill="none" stroke="{}" stroke-width="{}" stroke-linecap="round" stroke-linejoin="round"/>"#,
+                    trace.get_layer(),
                     points(&trace.polyline().corner_approx_arr()),
                     layer_color(board, trace.get_layer()), 2 * trace.get_half_width()
                 ));
@@ -88,7 +89,7 @@ pub fn board_svg_in(
                 };
                 for layer in pin.first_layer(&ctx)..=pin.last_layer(&ctx) {
                     if let Some(shape) = pin.get_shape_on_layer(layer, &ctx) {
-                        out.push_str(&shape_svg(&shape, fill, 1.0));
+                        out.push_str(&shape_svg(&shape, fill, 1.0, &format!("l{layer}")));
                     }
                 }
                 if pin.first_layer(&ctx) != pin.last_layer(&ctx) {
@@ -102,7 +103,7 @@ pub fn board_svg_in(
             }
             Item::Via(via) => {
                 if let Some(shape) = via.get_shape_on_layer(via.first_layer(&ctx), &ctx) {
-                    out.push_str(&shape_svg(&shape, "#edcf86", 1.0));
+                    out.push_str(&shape_svg(&shape, "#edcf86", 1.0, "via"));
                 }
                 if let Some(stack) = via.get_padstack(&ctx) {
                     out.push_str(&drill_svg(
@@ -115,7 +116,8 @@ pub fn board_svg_in(
                 for i in 0..item.tile_shape_count(&ctx) {
                     if let Some(shape) = board.item_tile_shape_ref(item.id(), i) {
                         out.push_str(&format!(
-                            r##"<polygon points="{}" fill="#83c5af" opacity="0.15"/>"##,
+                            r##"<polygon class="l{}" points="{}" fill="#83c5af" opacity="0.15"/>"##,
+                            item.shape_layer(i, &ctx),
                             points(&shape.corner_approx_arr())
                         ));
                     }

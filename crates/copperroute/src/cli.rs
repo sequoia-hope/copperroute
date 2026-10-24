@@ -473,6 +473,14 @@ pub struct ReshapeArgs {
     /// transition, instead of every `--repair-every` steps.
     #[arg(long)]
     pub repair_at_keyframes: bool,
+    /// When a repair is due, rip up all the routing, not only the violating copper, and route
+    /// the board again from the design's own fixed wiring.
+    #[arg(long)]
+    pub reroute: bool,
+    /// With `--reroute`, rip up the design's own fixed wiring too and route the board from its
+    /// pads alone.
+    #[arg(long)]
+    pub rip_design_wiring: bool,
     /// The reroute's time limit, in milliseconds.
     #[arg(long, default_value_t = 60_000)]
     pub repair_ms: i32,
@@ -491,6 +499,14 @@ pub struct ReshapeArgs {
     /// they are, and write the session of that step.
     #[arg(long)]
     pub stop_at: Option<i64>,
+    /// After the relaxation, move each part whose pads the copper still presses on by up to
+    /// this many millimetres the way it is pushed, then relax again. Parts sharing a pour move
+    /// as one. 0 never nudges.
+    #[arg(long, default_value_t = 0.0)]
+    pub nudge_mm: f64,
+    /// Parts the nudge never moves, as `--lock J1,U7`.
+    #[arg(long, value_delimiter = ',')]
+    pub lock: Vec<String>,
     /// The router backend for the repair reroute.
     #[arg(long, default_value = "grid")]
     pub repair_backend: String,
