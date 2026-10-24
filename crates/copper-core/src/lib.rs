@@ -11,6 +11,7 @@ pub mod manifest;
 pub mod grid_backend;
 pub mod nudge;
 pub mod pipeline;
+pub mod preview;
 pub mod progress;
 pub mod save;
 pub mod stats_from_bytes;

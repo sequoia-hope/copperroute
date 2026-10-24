@@ -284,6 +284,11 @@ fn import_session(session: Option<&Path>, board: &mut Board, transform: &Coordin
         }
         return;
     }
+    match super::fixed_wiring::apply_sidecar(session, board) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("{n} fixed items superseded by {}", session.display()),
+        Err(error) => tracing::error!("{error}"),
+    }
     match copper_dsn::ses_reader::read(&bytes[..], board, transform) {
         Ok(summary) => tracing::info!(
             "Session loaded from {}: {} components moved, {} wires, {} vias imported, {} errors",
@@ -680,4 +685,38 @@ mod pad_clearance_tests {
             assert!(apply_pad_clearance_metadata(&mut board, &[floor]).is_err());
         }
     }
+}
+
+/// Unfixes the fixed traces and vias on `nets` (net names, or `all`) so the router may rip and
+/// reroute them. Returns how many items were retired.
+pub fn retire_fixed(board: &mut copper_board::Board, nets: &[String]) -> Result<usize, String> {
+    if nets.is_empty() {
+        return Ok(0);
+    }
+    let all = nets.iter().any(|n| n == "all");
+    let mut numbers = std::collections::BTreeSet::new();
+    if !all {
+        for name in nets {
+            let found = board.rules.nets.get_by_name(name);
+            if found.is_empty() {
+                return Err(format!("--retire-fixed {name}: no such net on the board"));
+            }
+            numbers.extend(found.iter().map(|net| net.net_number));
+        }
+    }
+    let retired: Vec<copper_board::ItemId> = board
+        .get_items()
+        .filter(|item| {
+            (item.is_trace() || matches!(item, copper_board::Item::Via(_)))
+                && item.is_user_fixed()
+                && (all || item.net_nos().iter().any(|n| numbers.contains(n)))
+        })
+        .map(copper_board::Item::id)
+        .collect();
+    for &id in &retired {
+        if let Some(item) = board.get_item_mut(id) {
+            item.set_fixed_state(copper_board::structure::FixedState::Unfixed);
+        }
+    }
+    Ok(retired.len())
 }

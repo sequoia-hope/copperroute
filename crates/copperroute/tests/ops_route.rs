@@ -30,6 +30,7 @@ fn request(dsn: PathBuf, output: OutputTarget, set: Vec<String>) -> RouteRequest
         memory_ceiling: None,
         backend: &copper_core::MazeBackend,
         lock: Vec::new(),
+        retire_fixed: Vec::new(),
     }
 }
 

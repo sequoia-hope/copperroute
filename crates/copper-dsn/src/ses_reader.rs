@@ -209,15 +209,22 @@ impl SesReader<'_> {
         let Some(current) = component.get_location().map(Point::to_float) else {
             return Ok(false);
         };
-        if component.placed_on_front() != on_front
-            || (component.get_rotation_in_degree() - rotation)
-                .rem_euclid(360.0)
-                .min((rotation - component.get_rotation_in_degree()).rem_euclid(360.0))
-                > 0.01
-        {
+        if component.placed_on_front() != on_front {
             return Ok(false);
         }
         let id = component.id;
+        let turn = (rotation - component.get_rotation_in_degree()).rem_euclid(360.0);
+        if turn.min(360.0 - turn) > 0.01 {
+            // Components::rotate turns the other way on the back when flipping rotates first.
+            let flip_style = self.board.components.get_flip_style_rotate_first();
+            let world = if flip_style && !on_front { -turn } else { turn };
+            let pole = IntPoint::new(current.x.round() as i32, current.y.round() as i32);
+            self.board.components.rotate(id, world, &pole);
+            for item in self.board.get_component_items(id) {
+                self.board.rotate_item_approx(item, world, &current);
+            }
+            self.components_moved += 1;
+        }
         let denominator = self.session_file_scale_denominator;
         let delta = IntVector::new(
             (location[0] / denominator - current.x).round() as i32,

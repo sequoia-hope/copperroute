@@ -18,6 +18,7 @@ fn oracle() -> MoveOracle {
     MoveOracle {
         guard: 0.0,
         routable_copper_is_soft: true,
+        fixed_copper_bends: false,
     }
 }
 

@@ -60,11 +60,15 @@ pub struct RouteRequest {
     pub backend: &'static dyn RouterBackend,
     /// References of parts placement tools must not move.
     pub lock: Vec<String>,
+    /// Nets whose fixed wiring the router may rip and reroute, or `all`.
+    pub retire_fixed: Vec<String>,
 }
 
 pub struct RouteOutcome {
     pub job: RoutingJob,
     pub session: Vec<u8>,
+    /// The design's fixed wiring the session replaces.
+    pub superseded: Vec<super::fixed_wiring::Superseded>,
     pub format: OutputFormat,
     pub state: RoutingJobState,
     pub result: RoutingResult,
@@ -110,6 +114,11 @@ pub fn route(request: RouteRequest) -> Result<RouteOutcome, OpError> {
     }
     for &id in &locked {
         board.components.get_mut(id).position_fixed = true;
+    }
+    let designed = super::fixed_wiring::system_fixed_wiring(&board);
+    let retired = super::load::retire_fixed(&mut board, &request.retire_fixed).map_err(OpError::Input)?;
+    if retired > 0 {
+        tracing::info!("retired {retired} fixed trace(s) and via(s)");
     }
 
     if let OutputTarget::File(path) = &request.output {
@@ -164,6 +173,7 @@ pub fn route(request: RouteRequest) -> Result<RouteOutcome, OpError> {
     for &id in &locked {
         board.components.get_mut(id).position_fixed = false;
     }
+    let superseded = super::fixed_wiring::supersede(&mut board, &designed, &transform);
     let session = match format {
         OutputFormat::Ses => {
             let mut buffer = Vec::new();
@@ -177,6 +187,7 @@ pub fn route(request: RouteRequest) -> Result<RouteOutcome, OpError> {
     Ok(RouteOutcome {
         job,
         session,
+        superseded,
         format,
         state,
         result,

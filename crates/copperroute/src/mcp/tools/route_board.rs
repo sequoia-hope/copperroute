@@ -37,6 +37,7 @@ pub fn run(
         memory_ceiling: state.memory_ceiling,
         backend: &copper_core::MazeBackend,
         lock: Vec::new(),
+        retire_fixed: Vec::new(),
     })
     .map_err(super::rpc_error)?;
     outcome.job.id = super::mint_job_id();

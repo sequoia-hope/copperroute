@@ -59,6 +59,7 @@ fn shoving_keeps_every_connection_and_adds_no_violation() {
     let oracle = MoveOracle {
         guard: 0.0,
         routable_copper_is_soft: false,
+        fixed_copper_bends: false,
     };
     let open_before = unconnected(&mut board);
     let before = violations(&mut board);
@@ -128,10 +129,12 @@ fn a_soft_move_onto_other_nets_copper_rips_it_and_adds_no_violation() {
     let soft = MoveOracle {
         guard: 0.0,
         routable_copper_is_soft: true,
+        fixed_copper_bends: false,
     };
     let hard = MoveOracle {
         guard: 0.0,
         routable_copper_is_soft: false,
+        fixed_copper_bends: false,
     };
     let span = board.bounding_box.ur.x - board.bounding_box.ll.x;
     let ids: Vec<i32> = board
@@ -205,6 +208,7 @@ fn placing_a_part_far_away_shoves_and_never_adds_a_violation() {
         let oracle = MoveOracle {
             guard: 0.0,
             routable_copper_is_soft: soft,
+            fixed_copper_bends: false,
         };
         for &id in ids.iter().take(10) {
             let mut trial = board.clone();
@@ -258,6 +262,7 @@ fn a_site_search_places_parts_near_their_partners_without_new_violations() {
     let oracle = MoveOracle {
         guard: 0.0,
         routable_copper_is_soft: true,
+        fixed_copper_bends: false,
     };
     let mut placed = 0;
     for &id in ids.iter().take(12) {
@@ -299,6 +304,7 @@ fn accepted_drags_stay_within_the_net_length_cap() {
     let oracle = MoveOracle {
         guard: 0.0,
         routable_copper_is_soft: false,
+        fixed_copper_bends: false,
     };
     let ids: Vec<i32> = board
         .components
@@ -341,6 +347,7 @@ fn warping_keeps_every_connection_adds_no_violation_and_bends_copper() {
     let oracle = MoveOracle {
         guard: 0.0,
         routable_copper_is_soft: false,
+        fixed_copper_bends: false,
     };
     let span = board.bounding_box.ur.x - board.bounding_box.ll.x;
     let ids: Vec<i32> = board
@@ -402,6 +409,7 @@ fn settle_moves_parts_toward_targets_on_a_routed_board_without_damage() {
     let oracle = MoveOracle {
         guard: 0.0,
         routable_copper_is_soft: false,
+        fixed_copper_bends: false,
     };
     let per_mm = board
         .communication

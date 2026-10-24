@@ -328,6 +328,7 @@ dependencies = [
  "copper-geometry",
  "copper-router",
  "testkit",
+ "tracing",
 ]
 
 [[package]]

@@ -1,4 +1,5 @@
 pub mod drc;
+pub mod fixed_wiring;
 pub mod info;
 pub mod load;
 pub mod route;

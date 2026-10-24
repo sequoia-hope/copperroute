@@ -1,6 +1,8 @@
 pub mod blame;
 pub mod drc;
+pub mod frames;
 pub mod info;
+pub mod reshape;
 pub mod route;
 pub mod settle;
 

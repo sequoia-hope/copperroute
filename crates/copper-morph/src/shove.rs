@@ -12,6 +12,7 @@ use copper_board::{Board, ItemId};
 use copper_geometry::{IntPoint, IntVector, Point, TileShape, Vector};
 use copper_router::board_ext::ForcedPadRouter;
 
+use crate::frames;
 use crate::oracle::MoveOracle;
 
 const MAX_RECURSION: i32 = 20;
@@ -25,6 +26,7 @@ impl MoveOracle {
         if *by == IntVector::ZERO {
             return true;
         }
+        let _scope = frames::scope("shove");
         let fixed_only = MoveOracle {
             routable_copper_is_soft: true,
             ..*self
@@ -57,6 +59,7 @@ impl MoveOracle {
             return false;
         }
         *board = trial;
+        frames::committed(board, components, by);
         true
     }
 
@@ -73,6 +76,7 @@ impl MoveOracle {
             return false;
         };
         let by = IntVector::new(target.x - location.x, target.y - location.y);
+        let _scope = frames::scope("place");
         self.translate_shoving(board, &[component_id], &by)
     }
 
@@ -85,11 +89,19 @@ impl MoveOracle {
             .into_iter()
             .filter(|pair| !known.contains(pair))
             .collect();
-        if fresh.is_empty() {
+        if !self.routable_copper_is_soft {
+            if !fresh.is_empty() {
+                tracing::debug!("new violations: {fresh:?}");
+                return false;
+            }
+            if disconnects(before, after) {
+                tracing::debug!("the move opens a connection");
+                return false;
+            }
             return true;
         }
-        if !self.routable_copper_is_soft {
-            return false;
+        if fresh.is_empty() {
+            return true;
         }
         let mut ripped = BTreeSet::new();
         for (a, b) in fresh {
@@ -107,6 +119,24 @@ impl MoveOracle {
     }
 }
 
+/// Copper that moved so its ends no longer meet what they joined, which the DRC does not count
+/// as a violation.
+fn disconnects(before: &Board, after: &Board) -> bool {
+    let (was, now) = (copper_drc::all_airlines(before), copper_drc::all_airlines(after));
+    if now.len() > was.len() {
+        let ends = |a: &copper_drc::AirLine| {
+            format!(
+                "net {} ({:.0}, {:.0}) - ({:.0}, {:.0})",
+                a.net_number, a.from_corner.x, a.from_corner.y, a.to_corner.x, a.to_corner.y
+            )
+        };
+        let was: BTreeSet<String> = was.iter().map(ends).collect();
+        let opened: Vec<String> = now.iter().map(ends).filter(|e| !was.contains(e)).collect();
+        tracing::debug!("opened: {opened:?}");
+    }
+    now.len() > was.len()
+}
+
 /// The settle engine's net-length cap: no net of the moved parts may grow past
 /// `max(1.25 * L0, L0 + 4 mm)` of copper.
 pub(crate) fn within_length_caps(before: &Board, after: &Board, components: &[i32]) -> bool {
@@ -121,7 +151,16 @@ pub(crate) fn within_length_caps(before: &Board, after: &Board, components: &[i3
         .collect();
     nets.into_iter().all(|net| {
         let start = net_length(before, net);
-        net_length(after, net) <= (1.25 * start).max(start + 4.0 * per_mm)
+        let end = net_length(after, net);
+        let fits = end <= (1.25 * start).max(start + 4.0 * per_mm);
+        if !fits {
+            tracing::debug!(
+                "net {net} grows from {:.3} to {:.3} mm",
+                start / per_mm,
+                end / per_mm
+            );
+        }
+        fits
     })
 }
 
@@ -215,6 +254,7 @@ impl MoveOracle {
         pitch: i32,
         attempts: usize,
     ) -> Option<IntVector> {
+        let _scope = frames::scope("partners");
         let ideal = partner_offset(board, component_id)?;
         let fixed_only = MoveOracle {
             routable_copper_is_soft: true,

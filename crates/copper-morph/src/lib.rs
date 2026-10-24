@@ -5,11 +5,16 @@
 //! conflict that was not already there before the move. Pairs that start in conflict are
 //! grandfathered, so a board that is not DRC-clean can still be nudged without being made worse.
 
+mod dipole;
+pub mod frames;
 mod oracle;
+mod reshape;
 mod settle;
 mod shove;
 mod warp;
 
-pub use oracle::{Conflict, MoveOracle, scale};
+pub use dipole::{Dipole, dipole_targets};
+pub use reshape::{PartMove, ReshapeReport, reshape_step};
+pub use oracle::{Conflict, MoveOracle, pinned_by_fixed_copper, scale};
 pub use settle::{MoveKind, PartOutcome, SettleOptions, SettleReport};
 pub use warp::WarpField;

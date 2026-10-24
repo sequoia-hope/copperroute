@@ -48,6 +48,9 @@ pub enum Command {
     /// Report, for each open connection, what stands in its way and how far each movable part
     /// in the way must move to clear it.
     Blame(BlameArgs),
+    /// Change the board's shape step by step along a plan (tools/morph_outline.py), carrying
+    /// parts and copper with it, and write the session of the last step.
+    Reshape(ReshapeArgs),
     /// Serve the routing tools over JSON-RPC on stdin/stdout.
     Mcp,
 }
@@ -83,6 +86,14 @@ pub struct RouteArgs {
     /// Parts placement tools must not move, by reference: --lock J1,U7. Repeatable.
     #[arg(long, value_delimiter = ',', value_name = "REF")]
     pub lock: Vec<String>,
+    /// Write an SVG of the board after every nudge kept, with frames.jsonl, into this empty
+    /// directory.
+    #[arg(long)]
+    pub morph_frames: Option<PathBuf>,
+    /// Unfix the user-fixed traces and vias on these nets (or `all`) so the router may rip and
+    /// reroute them. Repeatable.
+    #[arg(long, value_delimiter = ',', value_name = "NET")]
+    pub retire_fixed: Vec<String>,
     /// Override one setting: --set router.<section>.<field>=<value>. Repeatable.
     /// router.max_items=N stops the optimizer as well as the router; --max-passes stops
     /// only the router.
@@ -130,7 +141,35 @@ pub struct SettleArgs {
     pub ses: PathBuf,
     /// JSON object of component reference to [dx, dy] in millimetres.
     #[arg(long)]
-    pub targets: PathBuf,
+    pub targets: Option<PathBuf>,
+    /// A push field adding to the targets of every free part near (x, y), in millimetres; the
+    /// push falls off as (1 + d²/radius²)^(-decay/2). Defaults: radius 3, decay 2. Repeatable.
+    #[arg(long, value_name = "X,Y,DX,DY[,RADIUS[,DECAY]]")]
+    pub dipole: Vec<String>,
+    /// Before settling, move each of these parts to where its pins centre on the pins they
+    /// connect to, or the nearest admissible place to it.
+    #[arg(long, value_delimiter = ',', value_name = "REF")]
+    pub near_partners: Vec<String>,
+    /// Parts that may not move, by reference: --lock J1,U7. Repeatable.
+    #[arg(long, value_delimiter = ',', value_name = "REF")]
+    pub lock: Vec<String>,
+    /// Unfix the user-fixed traces and vias on these nets (or `all`) so the router may rip and
+    /// reroute them. Repeatable.
+    #[arg(long, value_delimiter = ',', value_name = "NET")]
+    pub retire_fixed: Vec<String>,
+    /// Let the warp field bend fixed copper attached to a moving part instead of refusing the
+    /// move; the copper stays fixed.
+    #[arg(long)]
+    pub bend_fixed: bool,
+    /// Settle with one move kind alone.
+    #[arg(long, value_parser = ["warp", "shove", "push", "group"])]
+    pub only: Option<String>,
+    /// Write an SVG of the board after every move kept, with frames.jsonl, into this empty
+    /// directory.
+    #[arg(long)]
+    pub frames: Option<PathBuf>,
+    #[arg(long, default_value_t = 2000)]
+    pub max_frames: usize,
     /// Where to write the settled session (.ses), placement included.
     #[arg(short, long)]
     pub output: PathBuf,
@@ -163,6 +202,14 @@ pub struct BlameArgs {
     /// Parts that may not move, by reference: --lock J1,U7. Repeatable.
     #[arg(long, value_delimiter = ',', value_name = "REF")]
     pub lock: Vec<String>,
+    /// Unfix the user-fixed traces and vias on these nets (or `all`) so the router may rip and
+    /// reroute them. Repeatable.
+    #[arg(long, value_delimiter = ',', value_name = "NET")]
+    pub retire_fixed: Vec<String>,
+    /// Let the warp field bend fixed copper attached to a moving part instead of refusing the
+    /// move; the copper stays fixed.
+    #[arg(long)]
+    pub bend_fixed: bool,
     /// Cost of crossing a cell of routed copper, which the router may rip, against 10 per
     /// step; omit to make routed copper a wall.
     #[arg(long)]
@@ -390,4 +437,45 @@ mod tests {
             Cli::try_parse_from(["copperroute", "--settings", "s.json", "info", "a.dsn"]).unwrap();
         assert_eq!(cli.settings, Some(PathBuf::from("s.json")));
     }
+}
+
+#[derive(Args, Debug)]
+pub struct ReshapeArgs {
+    /// A Specctra DSN, a KiCad board JSON, or a KiCad .kicad_pcb board.
+    pub input: PathBuf,
+    /// The routed session to start from.
+    #[arg(long)]
+    pub ses: PathBuf,
+    /// The plan: board_outline, then steps of outline (mm) and part moves [dx, dy, turn].
+    #[arg(long)]
+    pub plan: PathBuf,
+    /// Where to write the session of the last step (.ses), placement included; the step's
+    /// outline goes beside it as .outline.json.
+    #[arg(short, long)]
+    pub output: PathBuf,
+    /// A KiCad .kicad_pro whose design rules are applied.
+    #[arg(long)]
+    pub kicad_project: Option<PathBuf>,
+    /// The last plan step to reach; the whole plan when omitted.
+    #[arg(long)]
+    pub to: Option<usize>,
+    /// The warp field's cell size, in millimetres.
+    #[arg(long, default_value_t = 0.25)]
+    pub cell_mm: f64,
+    /// Every this many steps (and at the last), rip the copper behind new violations, except on
+    /// differential pairs, and reroute what is open; 0 never repairs.
+    #[arg(long, default_value_t = 5)]
+    pub repair_every: usize,
+    /// The reroute's time limit, in milliseconds.
+    #[arg(long, default_value_t = 60_000)]
+    pub repair_ms: i32,
+    /// The router backend for the repair reroute.
+    #[arg(long, default_value = "grid")]
+    pub repair_backend: String,
+    /// Router settings for the repair reroute, as `--set router.fanout.enabled=false`. Repeatable.
+    #[arg(long, value_name = "KEY=VALUE")]
+    pub set: Vec<String>,
+    /// Write an SVG of the board after every step, with frames.jsonl, into this empty directory.
+    #[arg(long)]
+    pub frames: Option<PathBuf>,
 }

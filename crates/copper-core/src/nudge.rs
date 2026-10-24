@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use copper_board::Board;
 use copper_board::structure::Unit;
 use copper_geometry::IntVector;
-use copper_morph::MoveOracle;
+use copper_morph::{MoveOracle, frames};
 use copper_router::RouterError;
 use copper_router::pipeline::{
     NoopProgressSink, PipelineResult, ProgressSink, RouterBudget, RouterStop, run_pipeline,
@@ -66,6 +66,7 @@ impl RouterBackend for NudgeBackend {
         let oracle = MoveOracle {
             guard: GUARD_MM * per_mm,
             routable_copper_is_soft: true,
+            fixed_copper_bends: std::env::var("COPPERROUTE_NUDGE_BEND_FIXED").is_ok_and(|v| v == "1"),
         };
         let mut trial_settings = settings.clone();
         trial_settings.set_run_optimizer(false);
@@ -199,7 +200,7 @@ impl Nudger<'_> {
                 break;
             }
             let mut improved = false;
-            let moves = targeted::moves(board, self.per_mm);
+            let moves = targeted::moves(board, self.per_mm, self.oracle.fixed_copper_bends);
             tracing::info!(
                 "nudge round {round}: {} open, {} candidate move(s)",
                 self.open,
@@ -241,10 +242,14 @@ impl Nudger<'_> {
         smallest_mm: f64,
         to_beat: usize,
     ) -> Option<Trial> {
+        let _paused = frames::pause();
         let mut trial = board.clone();
-        let step = if self
-            .oracle
-            .translate_shoving(&mut trial, &[component], want)
+        let warped = self.oracle.fixed_copper_bends
+            && self.oracle.translate_warping(&mut trial, &[component], want);
+        let step = if warped
+            || self
+                .oracle
+                .translate_shoving(&mut trial, &[component], want)
         {
             *want
         } else {
@@ -293,6 +298,8 @@ impl Nudger<'_> {
         self.open = found.open;
         self.violations = found.violations;
         *board = found.board;
+        let _scope = frames::scope("nudge");
+        frames::committed(board, &[component], &found.step);
     }
 }
 
@@ -333,12 +340,18 @@ mod targeted {
 
     /// Clearing moves for the parts blocking each open connection, at full and one and a half
     /// times the computed displacement, smallest first.
-    pub(super) fn moves(board: &mut Board, per_mm: f64) -> Vec<(i32, IntVector)> {
-        let fixed: BTreeSet<i32> = board
+    pub(super) fn moves(board: &mut Board, per_mm: f64, bend_fixed: bool) -> Vec<(i32, IntVector)> {
+        let ids: Vec<(i32, bool)> = board
             .components
             .get_all()
-            .filter(|c| c.position_fixed)
-            .map(|c| c.id)
+            .map(|c| (c.id, c.position_fixed))
+            .collect();
+        let fixed: BTreeSet<i32> = ids
+            .into_iter()
+            .filter(|&(id, locked)| {
+                locked || (!bend_fixed && copper_morph::pinned_by_fixed_copper(board, id))
+            })
+            .map(|(id, _)| id)
             .collect();
         let options = |routed_copper| copper_gpu::BlameOptions {
             cell: BLAME_CELL_MM * per_mm,

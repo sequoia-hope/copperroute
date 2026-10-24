@@ -32,6 +32,16 @@ pub fn run(cli: &Cli, args: &RouteArgs, memory_ceiling: Option<u64>) -> ExitCode
         options
     });
 
+    let _recording = match &args.morph_frames {
+        Some(dir) => match super::frames::record(dir, 2000, String::new()) {
+            Ok(recording) => Some(recording),
+            Err(error) => {
+                tracing::error!("Couldn't record frames in {}: {error}", dir.display());
+                return ExitCode::Failure;
+            }
+        },
+        None => None,
+    };
     let outcome = match route(RouteRequest {
         load,
         output: OutputTarget::File(args.output.clone()),
@@ -41,6 +51,7 @@ pub fn run(cli: &Cli, args: &RouteArgs, memory_ceiling: Option<u64>) -> ExitCode
         memory_ceiling,
         backend: args.backend,
         lock: args.lock.clone(),
+        retire_fixed: args.retire_fixed.clone(),
     }) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -96,6 +107,10 @@ fn write_session(outcome: &RouteOutcome, path: &Path) -> bool {
             "Couldn't save the output file '{}': {error}",
             path.display()
         );
+        return false;
+    }
+    if let Err(error) = crate::ops::fixed_wiring::write_sidecar(path, &outcome.superseded) {
+        tracing::error!("Couldn't save the superseded wiring beside '{}': {error}", path.display());
         return false;
     }
     !outcome.session.is_empty()

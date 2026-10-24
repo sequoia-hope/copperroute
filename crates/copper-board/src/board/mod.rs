@@ -14,7 +14,7 @@ pub mod trace_normalize;
 use item_store::ItemStore;
 use std::borrow::Cow;
 
-use copper_geometry::{Area, IntBox, Point, Polyline, PolylineShapeRef, TileShape, Vector};
+use copper_geometry::{Area, FloatPoint, IntBox, Point, Polyline, PolylineShapeRef, TileShape, Vector};
 
 pub use changed_area::ChangedArea;
 pub use clearance_override::{
@@ -854,6 +854,27 @@ impl Board {
             self.trees.insert(&mut item, &ctx);
             self.items.insert(id, item);
         }
+        true
+    }
+
+    /// Turns the item about `pole` and re-enters it into the search trees. Unlike `move_item_by`,
+    /// no traces are added to keep contacts: the caller moves what touches it.
+    pub fn rotate_item_approx(&mut self, id: ItemId, angle_in_degree: f64, pole: &FloatPoint) -> bool {
+        self.invalidate_cached_contacts();
+        if !self.items.contains_key(&id) {
+            return false;
+        }
+        self.save_for_undo(id);
+        let mut item = self
+            .items
+            .remove(&id)
+            .expect("Board::rotate_item_approx: present, just checked");
+        self.trees.remove(&mut item);
+        let ctx = item_ctx!(self);
+        item.rotate_approx(angle_in_degree, pole, &ctx);
+        self.trees.insert(&mut item, &ctx);
+        self.items.insert(id, item);
+        self.revision += 1;
         true
     }
 

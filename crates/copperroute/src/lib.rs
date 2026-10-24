@@ -55,6 +55,10 @@ pub fn run(raw: &[String]) -> ExitCode {
             Ok(_) => commands::blame::run(&cli, args),
             Err(code) => code,
         },
+        cli::Command::Reshape(args) => match commands::govern(&cli) {
+            Ok(_) => commands::reshape::run(&cli, args),
+            Err(code) => code,
+        },
         cli::Command::Mcp => match commands::govern(&cli) {
             Ok(ceiling) => match mcp::stdio::run(commands::overrides(&cli, &[]), ceiling) {
                 0 => ExitCode::Ok,

@@ -5,6 +5,8 @@ use copper_board::items::Item;
 use copper_board::{Board, DrcConstraints, ItemId};
 use copper_geometry::{IntVector, ShapeOps, TileShape, Vector};
 
+use crate::frames;
+
 /// A component item and what it would collide with. An item paired with itself means it would
 /// leave the board.
 pub type Conflict = (ItemId, ItemId);
@@ -20,6 +22,9 @@ pub struct MoveOracle {
     pub guard: f64,
     /// When set, copper the router may rip up does not block: it will be rerouted anyway.
     pub routable_copper_is_soft: bool,
+    /// When set, fixed copper attached to a moving part may be bent by the warp field, though
+    /// never ripped.
+    pub fixed_copper_bends: bool,
 }
 
 impl MoveOracle {
@@ -30,7 +35,7 @@ impl MoveOracle {
         component_id: i32,
         by: &IntVector,
     ) -> BTreeSet<Conflict> {
-        self.shortfalls(board, &[component_id], by)
+        self.shortfalls(board, &[component_id], by, false)
             .into_keys()
             .collect()
     }
@@ -45,6 +50,7 @@ impl MoveOracle {
         board: &mut Board,
         components: &[i32],
         by: &IntVector,
+        bending: bool,
     ) -> BTreeMap<Conflict, f64> {
         let constraints = copper_drc::constraints::resolve(board);
         let reach = f64::from(
@@ -67,7 +73,8 @@ impl MoveOracle {
         if *by != IntVector::ZERO {
             for (pin, copper) in attached_copper(board, &members) {
                 let routable = board.get_item(copper).is_some_and(Item::is_routable);
-                if !(routable && self.routable_copper_is_soft) {
+                let bends = bending && self.fixed_copper_bends && bendable(board, copper);
+                if !(routable && self.routable_copper_is_soft) && !bends {
                     note((pin, copper), HOPELESS);
                 }
             }
@@ -162,10 +169,21 @@ impl MoveOracle {
         components: &[i32],
         by: &IntVector,
     ) -> (f64, BTreeSet<Conflict>) {
-        let base = self.shortfalls(board, components, &IntVector::ZERO);
+        self.line_search_bending(board, components, by, false)
+    }
+
+    /// `line_search_group` for a move that bends attached copper instead of ripping it.
+    pub(crate) fn line_search_bending(
+        &self,
+        board: &mut Board,
+        components: &[i32],
+        by: &IntVector,
+        bending: bool,
+    ) -> (f64, BTreeSet<Conflict>) {
+        let base = self.shortfalls(board, components, &IntVector::ZERO, bending);
         let failing = |oracle: &Self, board: &mut Board, fraction: f64| -> BTreeSet<Conflict> {
             oracle
-                .shortfalls(board, components, &scale(by, fraction))
+                .shortfalls(board, components, &scale(by, fraction), bending)
                 .into_iter()
                 .filter(|(pair, margin)| base.get(pair).is_none_or(|before| *margin < before - 1.0))
                 .map(|(pair, _)| pair)
@@ -227,6 +245,7 @@ impl MoveOracle {
         if self.routable_copper_is_soft {
             self.rip_overrun_copper(board, components);
         }
+        frames::committed(board, components, by);
         true
     }
 
@@ -238,7 +257,7 @@ impl MoveOracle {
             ..*self
         };
         let overrun: Vec<ItemId> = hard
-            .shortfalls(board, components, &IntVector::ZERO)
+            .shortfalls(board, components, &IntVector::ZERO, false)
             .into_keys()
             .map(|(_, obstacle)| obstacle)
             .filter(|id| board.get_item(*id).is_some_and(Item::is_routable))
@@ -262,6 +281,7 @@ impl MoveOracle {
         by: &IntVector,
         depth: usize,
     ) -> Vec<(i32, IntVector)> {
+        let _scope = frames::scope("push");
         let mut moves = Vec::new();
         self.push_into(
             board,
@@ -332,6 +352,7 @@ impl MoveOracle {
         by: &IntVector,
         max_members: usize,
     ) -> (Vec<i32>, IntVector) {
+        let _scope = frames::scope("group");
         let mut group = vec![component_id];
         let mut frontier = vec![component_id];
         while let Some(current) = frontier.pop() {
@@ -402,6 +423,22 @@ pub fn scale(by: &IntVector, fraction: f64) -> IntVector {
 }
 
 /// (component item, attached trace or via) pairs.
+/// Wiring, however fixed, which bending moves but never rips. Specctra's `(type fix)` reads as
+/// system fixed, so the designer's scripted copper is system fixed too.
+pub(crate) fn bendable(board: &Board, id: ItemId) -> bool {
+    board
+        .get_item(id)
+        .is_some_and(|item| item.is_trace() || matches!(item, Item::Via(_)))
+}
+
+/// Whether fixed copper attached to the part stops every move that may not bend it.
+pub fn pinned_by_fixed_copper(board: &Board, component_id: i32) -> bool {
+    let members = group_items(board, &[component_id]);
+    attached_copper(board, &members)
+        .iter()
+        .any(|(_, copper)| !board.get_item(*copper).is_some_and(Item::is_routable))
+}
+
 fn attached_copper(board: &Board, members: &BTreeSet<ItemId>) -> Vec<(ItemId, ItemId)> {
     let mut attached = Vec::new();
     for &id in members {

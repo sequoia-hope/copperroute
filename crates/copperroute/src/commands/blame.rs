@@ -32,6 +32,15 @@ pub fn run(cli: &Cli, args: &BlameArgs) -> ExitCode {
         }
     }
 
+    match crate::ops::load::retire_fixed(board, &args.retire_fixed) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("retired {n} fixed trace(s) and via(s)"),
+        Err(error) => {
+            tracing::error!("{error}");
+            return ExitCode::UsageError;
+        }
+    }
+
     let per_mm = board.communication.get_resolution(Unit::Mm);
     let options = BlameOptions {
         cell: args.cell_mm * per_mm,
@@ -45,11 +54,17 @@ pub fn run(cli: &Cli, args: &BlameArgs) -> ExitCode {
         .get_all()
         .map(|c| (c.id, c.name.clone()))
         .collect();
-    let fixed: Vec<i32> = board
+    let ids: Vec<(i32, bool)> = board
         .components
         .get_all()
-        .filter(|c| c.position_fixed)
-        .map(|c| c.id)
+        .map(|c| (c.id, c.position_fixed))
+        .collect();
+    let fixed: Vec<i32> = ids
+        .into_iter()
+        .filter(|&(id, locked)| {
+            locked || (!args.bend_fixed && copper_morph::pinned_by_fixed_copper(board, id))
+        })
+        .map(|(id, _)| id)
         .collect();
     let name = |id: i32| names.get(&id).cloned().unwrap_or_else(|| id.to_string());
     let gaps: Vec<_> = copper_drc::DesignRulesChecker::new(board)

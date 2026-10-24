@@ -330,13 +330,14 @@ mod tests {
     }
 }
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use copper_board::items::Item;
 use copper_board::structure::Unit;
 use copper_board::{Board, FixedState, ItemId};
 use copper_geometry::{IntPoint, IntVector, Point, Polyline, Vector};
 
+use crate::frames;
 use crate::oracle::MoveOracle;
 
 /// Field cell size and how far its domain extends past the board, in millimetres (rubber's H
@@ -347,6 +348,8 @@ const MARGIN_MM: f64 = 3.0;
 const SPLIT_MM: f64 = 0.5;
 /// Traces displaced less than this (board units) everywhere are left untouched.
 const STILL: f64 = 1.0;
+/// Fixed copper is bent only where it would move by more than this, in millimetres.
+const FIXED_STILL_MM: f64 = 0.005;
 
 struct LiftedTrace {
     corners: Vec<FloatPoint>,
@@ -372,16 +375,42 @@ impl MoveOracle {
             routable_copper_is_soft: true,
             ..*self
         };
-        if fixed_only.line_search_group(board, components, by).0 < 1.0 {
+        let (fraction, blockers) = fixed_only.line_search_bending(board, components, by, true);
+        if fraction < 1.0 {
+            let names: Vec<String> = blockers
+                .iter()
+                .map(|(a, b)| format!("{} / {}", describe(board, *a), describe(board, *b)))
+                .collect();
+            tracing::debug!("warp refused: blocked at {fraction:.3} of the move by {names:?}");
             return false;
         }
+        let _scope = frames::scope("warp");
         let per_mm = board.communication.get_resolution(Unit::Mm);
+        let riders = self.vias_in_moving_pads(board, components);
         let fields: Vec<WarpField> = (0..board.get_layer_count())
-            .map(|layer| layer_field(board, components, by, layer, per_mm))
+            .map(|layer| layer_field(board, components, &riders, by, layer, per_mm))
             .collect();
+        let mut snaps = BTreeMap::new();
+        for &id in components
+            .iter()
+            .flat_map(|c| board.get_component_items(*c))
+            .chain(riders.iter().copied())
+            .collect::<Vec<_>>()
+            .iter()
+        {
+            if let Some(Point::Int(c)) = board.drill_center(id) {
+                snaps.insert((c.x, c.y), IntPoint::new(c.x + by.x, c.y + by.y));
+            }
+        }
 
         let mut trial = board.clone();
-        let lifted = lift_moving_traces(&mut trial, &fields, per_mm);
+        let lifted = lift_moving_traces(
+            &mut trial,
+            &fields,
+            per_mm,
+            self.fixed_copper_bends,
+            &riders,
+        );
         let vector = Vector::Int(*by);
         for &component in components {
             trial.components.move_component(component, &vector);
@@ -390,7 +419,7 @@ impl MoveOracle {
             .iter()
             .flat_map(|c| trial.get_component_items(*c))
             .collect();
-        for id in members {
+        for id in members.into_iter().chain(riders.iter().copied()) {
             if !matches!(trial.move_item_by(id, &vector), Ok(true)) {
                 return false;
             }
@@ -402,6 +431,10 @@ impl MoveOracle {
                 .iter()
                 .zip(&trace.anchored)
                 .map(|(c, anchored)| {
+                    let at = (c.x.round() as i32, c.y.round() as i32);
+                    if let Some(snapped) = snaps.get(&at) {
+                        return Point::Int(*snapped);
+                    }
                     let (dx, dy) = if *anchored {
                         (0.0, 0.0)
                     } else {
@@ -423,19 +456,65 @@ impl MoveOracle {
             );
         }
         if !self.settle_dragged_copper(board, &mut trial) {
+            tracing::debug!("warp refused: the warped copper breaks a rule or a connection");
             return false;
         }
         if !crate::shove::within_length_caps(board, &trial, components) {
+            tracing::debug!("warp refused: a net grows past its length cap");
             return false;
         }
         *board = trial;
+        frames::committed(board, components, by);
         true
+    }
+}
+
+fn describe(board: &Board, id: ItemId) -> String {
+    let Some(item) = board.get_item(id) else {
+        return format!("{id:?}");
+    };
+    let nets: Vec<String> = item
+        .net_nos()
+        .iter()
+        .map(|n| board.rules.nets.get(*n).map_or_else(|| n.to_string(), |net| net.name.clone()))
+        .collect();
+    format!(
+        "{:?} {:?} nets {nets:?} component {} {:?}",
+        id,
+        item.kind(),
+        item.component_id(),
+        item.get_fixed_state()
+    )
+}
+
+impl MoveOracle {
+    /// Vias whose drill centre is a moving pin's: contacts need identical centres, so they ride
+    /// with the part, when the oracle may move them.
+    fn vias_in_moving_pads(&self, board: &Board, components: &[i32]) -> Vec<ItemId> {
+        let centres: BTreeSet<(i32, i32)> = components
+            .iter()
+            .flat_map(|c| board.get_component_items(*c))
+            .filter_map(|id| match board.drill_center(id) {
+                Some(Point::Int(c)) => Some((c.x, c.y)),
+                _ => None,
+            })
+            .collect();
+        board
+            .get_items()
+            .filter(|item| matches!(item, Item::Via(_)))
+            .filter(|item| item.is_routable() || self.fixed_copper_bends)
+            .filter(|item| {
+                matches!(board.drill_center(item.id()), Some(Point::Int(c)) if centres.contains(&(c.x, c.y)))
+            })
+            .map(Item::id)
+            .collect()
     }
 }
 
 fn layer_field(
     board: &mut Board,
     components: &[i32],
+    riders: &[ItemId],
     by: &IntVector,
     layer: usize,
     per_mm: f64,
@@ -451,10 +530,15 @@ fn layer_field(
             field.add_inclusion(&shapes, (f64::from(by.x), f64::from(by.y)), true);
         }
     }
+    let shapes = shapes_on_layer(board, riders, layer);
+    if !shapes.is_empty() {
+        field.add_inclusion(&shapes, (f64::from(by.x), f64::from(by.y)), false);
+    }
     let anchors: Vec<ItemId> = board
         .get_items()
         .filter(|item| {
             !moving.contains(&item.id())
+                && !riders.contains(&item.id())
                 && matches!(item, Item::Pin(_) | Item::Via(_) | Item::ObstacleArea(_))
         })
         .map(Item::id)
@@ -541,7 +625,13 @@ fn parameter_on_segment(a: &FloatPoint, b: &FloatPoint, p: &FloatPoint) -> Optio
 
 /// Removes the routable traces the fields would move, returning them with their corners split
 /// finely enough to follow the field.
-fn lift_moving_traces(board: &mut Board, fields: &[WarpField], per_mm: f64) -> Vec<LiftedTrace> {
+fn lift_moving_traces(
+    board: &mut Board,
+    fields: &[WarpField],
+    per_mm: f64,
+    fixed_bends: bool,
+    riders: &[ItemId],
+) -> Vec<LiftedTrace> {
     let split = SPLIT_MM * per_mm;
     let junctions = junction_points(board);
     let mut lifted = Vec::new();
@@ -550,7 +640,7 @@ fn lift_moving_traces(board: &mut Board, fields: &[WarpField], per_mm: f64) -> V
         let Item::Trace(trace) = item else {
             continue;
         };
-        if !item.is_routable() {
+        if !item.is_routable() && !(fixed_bends && crate::oracle::bendable(board, item.id())) {
             continue;
         }
         let layer = trace.get_layer();
@@ -581,9 +671,14 @@ fn lift_moving_traces(board: &mut Board, fields: &[WarpField], per_mm: f64) -> V
         if let Some(last) = corners.last() {
             fine.push(*last);
         }
+        let still = if item.is_routable() {
+            STILL
+        } else {
+            FIXED_STILL_MM * per_mm
+        };
         let moves = fine.iter().any(|c| {
             let (dx, dy) = fields[layer].displacement(c);
-            dx.hypot(dy) > STILL
+            dx.hypot(dy) > still
         });
         if moves {
             ids.push(item.id());
@@ -598,7 +693,14 @@ fn lift_moving_traces(board: &mut Board, fields: &[WarpField], per_mm: f64) -> V
             });
         }
     }
-    board.remove_items(ids);
+    // The board refuses to delete fixed items, which bending lifts too; each goes back in with
+    // its fixed state.
+    for id in ids {
+        if let Some(item) = board.get_item_mut(id) {
+            item.set_fixed_state(FixedState::Unfixed);
+        }
+        board.remove_item(id);
+    }
     let staying: BTreeSet<(usize, i64, i64)> = board
         .get_items()
         .filter_map(|item| match item {
@@ -614,6 +716,19 @@ fn lift_moving_traces(board: &mut Board, fields: &[WarpField], per_mm: f64) -> V
             (layer, p.x.round() as i64, p.y.round() as i64)
         })
         .collect();
+    let ctx = board.ctx();
+    let vias: Vec<(usize, i64, i64)> = board
+        .get_items()
+        .filter(|item| matches!(item, Item::Via(_)) && !riders.contains(&item.id()))
+        .filter_map(|item| {
+            let c = board.drill_center(item.id())?.to_float();
+            Some((item.first_layer(&ctx)..=item.last_layer(&ctx)).map(move |layer| {
+                (layer, c.x.round() as i64, c.y.round() as i64)
+            }))
+        })
+        .flatten()
+        .collect();
+    let staying: BTreeSet<_> = staying.into_iter().chain(vias).collect();
     for trace in &mut lifted {
         let layer = trace.layer;
         trace.anchored = trace

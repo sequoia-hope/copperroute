@@ -9,6 +9,7 @@ use copper_board::Board;
 use copper_board::structure::Unit;
 use copper_geometry::IntVector;
 
+use crate::frames;
 use crate::oracle::{MoveOracle, scale};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -20,6 +21,8 @@ pub struct SettleOptions {
     pub patience: usize,
     pub push_depth: usize,
     pub max_group: usize,
+    /// Use this move alone, with no partial step when it fails.
+    pub only: Option<MoveKind>,
 }
 
 impl Default for SettleOptions {
@@ -30,6 +33,7 @@ impl Default for SettleOptions {
             patience: 5,
             push_depth: 1,
             max_group: 6,
+            only: None,
         }
     }
 }
@@ -65,6 +69,7 @@ impl MoveOracle {
         targets: &BTreeMap<i32, IntVector>,
         options: &SettleOptions,
     ) -> SettleReport {
+        let _scope = frames::scope("settle");
         let per_mm = board.communication.get_resolution(Unit::Mm);
         let step = options.step_mm * per_mm;
         let arrive = 0.5;
@@ -142,26 +147,35 @@ impl MoveOracle {
         want: &IntVector,
         options: &SettleOptions,
     ) -> Vec<(i32, MoveKind, IntVector)> {
-        if self.translate_warping(board, &[component], want) {
+        let allowed = |kind| options.only.is_none_or(|only| only == kind);
+        if allowed(MoveKind::Warp) && self.translate_warping(board, &[component], want) {
             return vec![(component, MoveKind::Warp, *want)];
         }
-        if self.translate_shoving(board, &[component], want) {
+        if allowed(MoveKind::Shove) && self.translate_shoving(board, &[component], want) {
             return vec![(component, MoveKind::Shove, *want)];
         }
-        let pushed = self.push(board, component, want, options.push_depth);
-        if pushed.iter().any(|(c, _)| *c == component) {
-            return pushed
-                .into_iter()
-                .map(|(c, v)| (c, MoveKind::Push, v))
-                .collect();
+        if allowed(MoveKind::Push) {
+            let pushed = self.push(board, component, want, options.push_depth);
+            if pushed.iter().any(|(c, _)| *c == component) {
+                return pushed
+                    .into_iter()
+                    .map(|(c, v)| (c, MoveKind::Push, v))
+                    .collect();
+            }
         }
-        let (group, step) = self.group_step(board, component, want, options.max_group);
-        if step != IntVector::ZERO {
-            return group
-                .into_iter()
-                .map(|c| (c, MoveKind::Group, step))
-                .collect();
+        if allowed(MoveKind::Group) {
+            let (group, step) = self.group_step(board, component, want, options.max_group);
+            if step != IntVector::ZERO {
+                return group
+                    .into_iter()
+                    .map(|c| (c, MoveKind::Group, step))
+                    .collect();
+            }
         }
+        if options.only.is_some() {
+            return Vec::new();
+        }
+        let _scope = frames::scope("step");
         let (fraction, _) = self.line_search(board, component, want);
         let partial = scale(want, fraction);
         if partial != IntVector::ZERO && self.translate(board, component, &partial) {
