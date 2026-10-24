@@ -1,6 +1,6 @@
 //! Changing the board's shape: one step moves the outline from one polygon to another and carries
 //! everything on the board with it. Parts move rigidly (turned and shifted as the caller says);
-//! one harmonic field, pinned to the outline's points and to every pad, carries the rest: trace
+//! one harmonic field, pinned to every pad and pushed by the new outline, carries the rest: trace
 //! corners, vias, and the small keepouts and pours, which move rigidly with the field at their
 //! centre. Trace corners on a pin or via centre land exactly on its new centre, so contacts hold.
 
@@ -14,6 +14,7 @@ use copper_geometry::{
 };
 
 use crate::frames;
+use crate::relax::{inside, nearest_on_polygon};
 use crate::warp::WarpField;
 
 /// A part's rigid move for one step: turned about its location, then shifted.
@@ -36,7 +37,7 @@ const SPLIT_MM: f64 = 0.5;
 /// Areas larger than this bend with the field, corner by corner; smaller ones move rigidly.
 const LARGE_AREA_MM: f64 = 3.0;
 
-/// One step: the outline goes from `from` to `to` (corresponding points, board units) and each part
+/// One step: the outline goes from `from` to `to` (board units) and each part
 /// in `moves` moves rigidly. `cell_mm` is the field's grid. The two nets of each pair in
 /// `pairs` move together: a corner takes the field at the midpoint to its partner's nearest
 /// corner, so the pair's gap survives a field that squeezes across it.
@@ -58,23 +59,19 @@ pub fn reshape_step(
         .collect();
 
     let bounds = box_around(from.iter().chain(to).copied(), &board.bounding_box);
-    let mut field = WarpField::new(&bounds, cell_mm * per_mm, MARGIN_MM * per_mm);
     let pin = (0.5 * cell_mm * per_mm).round() as i32;
-    for (old, new) in from.iter().zip(to) {
-        let at = IntPoint::new(old.x.round() as i32, old.y.round() as i32);
-        field.add_inclusion(&[square(at, pin)], (new.x - old.x, new.y - old.y), false);
+    let pads = pad_inclusions(board, &pin_moves, pin);
+    let mut parts_only = WarpField::new(&bounds, cell_mm * per_mm, MARGIN_MM * per_mm);
+    for (shapes, vector) in &pads {
+        parts_only.add_inclusion(shapes, *vector, false);
     }
-    for (id, old, new) in &pin_moves {
-        let count = board
-            .get_item(*id)
-            .map_or(0, |item| item.tile_shape_count(&board.ctx()));
-        let mut shapes: Vec<TileShape> = (0..count)
-            .filter_map(|i| board.item_tile_shape_ref(*id, i).map(|s| s.into_owned()))
-            .collect();
-        if shapes.is_empty() {
-            shapes.push(square(*old, pin));
-        }
-        let vector = (f64::from(new.x - old.x), f64::from(new.y - old.y));
+    parts_only.solve();
+    let mut field = WarpField::new(&bounds, cell_mm * per_mm, MARGIN_MM * per_mm);
+    for old in from {
+        let at = IntPoint::new(old.x.round() as i32, old.y.round() as i32);
+        field.add_inclusion(&[square(at, pin)], edge_contact(&parts_only, old, to), false);
+    }
+    for (shapes, vector) in pads {
         field.add_inclusion(&shapes, vector, false);
     }
     field.solve();
@@ -116,17 +113,58 @@ pub fn reshape_step(
         }
     }
 
-    let vias: Vec<ItemId> = board
+    let partner: BTreeMap<i32, i32> = pairs
+        .iter()
+        .flat_map(|&(p, n)| [(p, n), (n, p)])
+        .collect();
+    let mut corners_of: BTreeMap<(i32, Option<usize>), Vec<FloatPoint>> = BTreeMap::new();
+    for trace in &lifted {
+        for net in &trace.nets {
+            if partner.contains_key(net) {
+                corners_of.entry((*net, Some(trace.layer))).or_default().extend(&trace.corners);
+            }
+        }
+    }
+    for item in board.get_items() {
+        if let (Item::Via(_), Some(Point::Int(centre))) = (item, board.drill_center(item.id())) {
+            for net in item.net_nos() {
+                if partner.contains_key(net) {
+                    corners_of.entry((*net, None)).or_default().push(centre.to_float());
+                }
+            }
+        }
+    }
+    let reach = 1.0 * per_mm;
+    let pair_point = |nets: &[i32], layer: Option<usize>, c: &FloatPoint| -> FloatPoint {
+        let Some(other) = nets.iter().find_map(|n| partner.get(n)) else {
+            return *c;
+        };
+        let nearest = corners_of
+            .get(&(*other, layer))
+            .into_iter()
+            .flatten()
+            .min_by(|a, b| {
+                (a.x - c.x).hypot(a.y - c.y).total_cmp(&(b.x - c.x).hypot(b.y - c.y))
+            });
+        match nearest {
+            Some(q) if (q.x - c.x).hypot(q.y - c.y) <= reach => {
+                FloatPoint::new((c.x + q.x) / 2.0, (c.y + q.y) / 2.0)
+            }
+            _ => *c,
+        }
+    };
+
+    let vias: Vec<(ItemId, Vec<i32>)> = board
         .get_items()
         .filter(|item| matches!(item, Item::Via(_)))
-        .map(Item::id)
+        .map(|item| (item.id(), item.net_nos().to_vec()))
         .collect();
-    for id in vias {
+    for (id, nets) in vias {
         let Some(Point::Int(old)) = board.drill_center(id) else {
             continue;
         };
         let new = snaps.get(&(old.x, old.y)).copied().unwrap_or_else(|| {
-            let (dx, dy) = field.displacement(&old.to_float());
+            let (dx, dy) = field.displacement(&pair_point(&nets, None, &old.to_float()));
             IntPoint::new(old.x + dx.round() as i32, old.y + dy.round() as i32)
         });
         let by = Vector::Int(copper_geometry::IntVector::new(new.x - old.x, new.y - old.y));
@@ -175,44 +213,12 @@ pub fn reshape_step(
     }
 
 
-    let partner: BTreeMap<i32, i32> = pairs
-        .iter()
-        .flat_map(|&(p, n)| [(p, n), (n, p)])
-        .collect();
-    let mut corners_of: BTreeMap<(i32, usize), Vec<FloatPoint>> = BTreeMap::new();
-    for trace in &lifted {
-        for net in &trace.nets {
-            if partner.contains_key(net) {
-                corners_of.entry((*net, trace.layer)).or_default().extend(&trace.corners);
-            }
-        }
-    }
-    let reach = 1.0 * per_mm;
-    let pair_point = |trace: &LiftedTrace, c: &FloatPoint| -> FloatPoint {
-        let Some(other) = trace.nets.iter().find_map(|n| partner.get(n)) else {
-            return *c;
-        };
-        let nearest = corners_of
-            .get(&(*other, trace.layer))
-            .into_iter()
-            .flatten()
-            .min_by(|a, b| {
-                (a.x - c.x).hypot(a.y - c.y).total_cmp(&(b.x - c.x).hypot(b.y - c.y))
-            });
-        match nearest {
-            Some(q) if (q.x - c.x).hypot(q.y - c.y) <= reach => {
-                FloatPoint::new((c.x + q.x) / 2.0, (c.y + q.y) / 2.0)
-            }
-            _ => *c,
-        }
-    };
-
     for trace in lifted {
         let mut points: Vec<Point> = Vec::with_capacity(trace.corners.len());
         for c in &trace.corners {
             let key = (c.x.round() as i32, c.y.round() as i32);
             let p = snaps.get(&key).copied().unwrap_or_else(|| {
-                let (dx, dy) = field.displacement(&pair_point(&trace, c));
+                let (dx, dy) = field.displacement(&pair_point(&trace.nets, Some(trace.layer), c));
                 IntPoint::new((c.x + dx).round() as i32, (c.y + dy).round() as i32)
             });
             if points.last() != Some(&Point::Int(p)) {
@@ -235,6 +241,41 @@ pub fn reshape_step(
     replace_outline(board, to);
     frames::committed(board, &moves.keys().copied().collect::<Vec<_>>(), &copper_geometry::IntVector::ZERO);
     report
+}
+
+fn pad_inclusions(
+    board: &Board,
+    pin_moves: &[(ItemId, IntPoint, IntPoint)],
+    pin: i32,
+) -> Vec<(Vec<TileShape>, (f64, f64))> {
+    pin_moves
+        .iter()
+        .map(|(id, old, new)| {
+            let count = board
+                .get_item(*id)
+                .map_or(0, |item| item.tile_shape_count(&board.ctx()));
+            let mut shapes: Vec<TileShape> = (0..count)
+                .filter_map(|i| board.item_tile_shape_ref(*id, i).map(|s| s.into_owned()))
+                .collect();
+            if shapes.is_empty() {
+                shapes.push(square(*old, pin));
+            }
+            (shapes, (f64::from(new.x - old.x), f64::from(new.y - old.y)))
+        })
+        .collect()
+}
+
+/// The outline is a contact, not a handle: copper at an edge point goes where the parts take it,
+/// unless that is outside the new outline, which then pushes it straight back onto the edge.
+/// A growing board leaves its copper alone, and a sliding edge doesn't drag it sideways.
+fn edge_contact(parts_only: &WarpField, old: &FloatPoint, to: &[FloatPoint]) -> (f64, f64) {
+    let (dx, dy) = parts_only.displacement(old);
+    let carried = FloatPoint::new(old.x + dx, old.y + dy);
+    if inside(to, &carried) {
+        return (dx, dy);
+    }
+    let edge = nearest_on_polygon(to, &carried);
+    (edge.x - old.x, edge.y - old.y)
 }
 
 /// Each pin of every part: its id, centre now, and centre after the part's rigid move (none for

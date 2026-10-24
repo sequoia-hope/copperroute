@@ -466,9 +466,17 @@ pub struct ReshapeArgs {
     /// differential pairs, and reroute what is open; 0 never repairs.
     #[arg(long, default_value_t = 5)]
     pub repair_every: usize,
+    /// Repair only at the plan's keyframes, the steps whose label names a shape rather than a
+    /// transition, instead of every `--repair-every` steps.
+    #[arg(long)]
+    pub repair_at_keyframes: bool,
     /// The reroute's time limit, in milliseconds.
     #[arg(long, default_value_t = 60_000)]
     pub repair_ms: i32,
+    /// After every step, this many rounds of pushing trace corners away from other nets' copper
+    /// closer than the clearance; 0 never relaxes.
+    #[arg(long, default_value_t = 0)]
+    pub relax: usize,
     /// The router backend for the repair reroute.
     #[arg(long, default_value = "grid")]
     pub repair_backend: String,

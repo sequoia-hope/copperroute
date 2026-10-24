@@ -203,12 +203,14 @@ impl<'a> TraceTightener<'a> {
                                 && matches!(board.items.get(&via_id), Some(Item::Via(_))) =>
                         {
                             let unchanged_trace_costs = trace_costs.expect("just matched");
-                            let moved = ViaOptimizer::opt_via_location(
+                            let base = self.base();
+                            let moved = ViaOptimizer::opt_via_location_until(
                                 board,
                                 via_id,
                                 Some(unchanged_trace_costs),
-                                self.base().min_translate_dist,
+                                base.min_translate_dist,
                                 10,
+                                &|| base.is_stop_requested(),
                             )?;
                             if p7t8b_oca_ledger() {
                                 eprintln!("OCAVIA id={} res={moved}", via_id.0);

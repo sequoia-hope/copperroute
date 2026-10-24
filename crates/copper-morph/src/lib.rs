@@ -8,12 +8,14 @@
 mod dipole;
 pub mod frames;
 mod oracle;
+mod relax;
 mod reshape;
 mod settle;
 mod shove;
 mod warp;
 
 pub use dipole::{Dipole, dipole_targets};
+pub use relax::{NetPair, RelaxReport, relax_clearance, simplify_traces};
 pub use reshape::{PartMove, ReshapeReport, reshape_step};
 pub use oracle::{Conflict, MoveOracle, pinned_by_fixed_copper, scale};
 pub use settle::{MoveKind, PartOutcome, SettleOptions, SettleReport};

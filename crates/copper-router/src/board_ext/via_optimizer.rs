@@ -17,6 +17,29 @@ impl ViaOptimizer {
         trace_pull_tight_accuracy: i32,
         max_recursion_depth: i32,
     ) -> Result<bool, BoardError> {
+        Self::opt_via_location_until(
+            board,
+            via,
+            trace_costs,
+            trace_pull_tight_accuracy,
+            max_recursion_depth,
+            &|| false,
+        )
+    }
+
+    /// `opt_via_location`, giving up between moves once `stop` says so: on copper that is not
+    /// pulled tight, each move finds another and one chain can run for minutes.
+    pub fn opt_via_location_until(
+        board: &mut Board,
+        via: ItemId,
+        trace_costs: Option<&[ExpansionCostFactor]>,
+        trace_pull_tight_accuracy: i32,
+        max_recursion_depth: i32,
+        stop: StopCheck<'_>,
+    ) -> Result<bool, BoardError> {
+        if stop() {
+            return Ok(false);
+        }
         let Some(item) = board.get_item(via) else {
             return Ok(false);
         };
@@ -49,11 +72,12 @@ impl ViaOptimizer {
             }
         }
         if is_plane_or_fanout_via {
-            return Self::opt_plane_or_fanout_via(
+            return Self::opt_plane_or_fanout_via_until(
                 board,
                 via,
                 trace_pull_tight_accuracy,
                 max_recursion_depth,
+                stop,
             );
         }
         let (Some(first_trace), Some(second_trace)) = (first_trace, second_trace) else {
@@ -132,12 +156,13 @@ impl ViaOptimizer {
             .rev()
             .find(|id| matches!(board.get_item(*id), Some(Item::Via(_))));
         if let Some(current_item) = first_picked_via {
-            Self::opt_via_location(
+            Self::opt_via_location_until(
                 board,
                 current_item,
                 trace_costs,
                 trace_pull_tight_accuracy,
                 max_recursion_depth - 1,
+                stop,
             )?;
         }
         Ok(true)
@@ -149,7 +174,23 @@ impl ViaOptimizer {
         trace_pull_tight_accuracy: i32,
         max_recursion_depth: i32,
     ) -> Result<bool, BoardError> {
-        if max_recursion_depth <= 0 {
+        Self::opt_plane_or_fanout_via_until(
+            board,
+            via,
+            trace_pull_tight_accuracy,
+            max_recursion_depth,
+            &|| false,
+        )
+    }
+
+    fn opt_plane_or_fanout_via_until(
+        board: &mut Board,
+        via: ItemId,
+        trace_pull_tight_accuracy: i32,
+        max_recursion_depth: i32,
+        stop: StopCheck<'_>,
+    ) -> Result<bool, BoardError> {
+        if max_recursion_depth <= 0 || stop() {
             return Ok(false);
         }
         let contact_list: Vec<ItemId> = board.normal_contacts(via).into_iter().rev().collect();
@@ -310,11 +351,12 @@ impl ViaOptimizer {
             )?;
         }
         if new_via_location == check_corner {
-            Self::opt_plane_or_fanout_via(
+            Self::opt_plane_or_fanout_via_until(
                 board,
                 via,
                 trace_pull_tight_accuracy,
                 max_recursion_depth - 1,
+                stop,
             )?;
         }
         Ok(true)

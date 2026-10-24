@@ -144,6 +144,7 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
     }
 
     let mut outline: Vec<FloatPoint> = plan.board_outline.iter().map(to_board).collect();
+    let tolerated = copper_morph::relax_clearance(board, 0, Some(&outline), &BTreeMap::new()).close_pairs;
     let mut applied: BTreeMap<i32, [f64; 3]> = BTreeMap::new();
     let pause = copper_morph::frames::pause();
     for (k, step) in plan.steps.iter().enumerate().take(last + 1) {
@@ -170,7 +171,20 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
         }
         let report = reshape_step(board, &outline, &target, &moves, args.cell_mm, &pair_nets);
         outline = target;
-        let due = args.repair_every > 0 && (k % args.repair_every == args.repair_every - 1 || k == last);
+        if args.relax > 0 {
+            let r = copper_morph::relax_clearance(board, args.relax, Some(&outline), &tolerated);
+            tracing::info!(
+                "step {k}: relaxed {} traces, overlaps {} -> {}",
+                r.traces_moved,
+                r.overlaps_before,
+                r.overlaps_after
+            );
+        }
+        let due = if args.repair_at_keyframes {
+            !step.label.contains('→')
+        } else {
+            args.repair_every > 0 && (k % args.repair_every == args.repair_every - 1 || k == last)
+        };
         let ripped = if due {
             repair(board, &allowed, &protected, &loaded.settings, args.repair_ms, backend)
         } else {
@@ -309,6 +323,33 @@ fn diff_pairs(board: &Board) -> Vec<(String, String)> {
     pairs
 }
 
+const SIMPLIFY_MM: f64 = 0.01;
+const OPT_CHANGED_AREA_MS: i32 = 1000;
+
+/// The items in violations beyond `allowed`, counted per kind and net pair, in the checker's order.
+fn new_violation_items(board: &mut Board, allowed: &BTreeMap<ViolationKey, usize>) -> Vec<ItemId> {
+    let mut seen: BTreeMap<ViolationKey, usize> = BTreeMap::new();
+    let mut items = Vec::new();
+    for (key, first, second) in violation_keys(board) {
+        let count = seen.entry(key.clone()).or_insert(0);
+        *count += 1;
+        if *count <= allowed.get(&key).copied().unwrap_or(0) {
+            continue;
+        }
+        tracing::debug!(
+            "new {key:?} between {:?} and {:?}",
+            board.get_item(first).map(Item::kind),
+            second.and_then(|id| board.get_item(id)).map(Item::kind)
+        );
+        for id in std::iter::once(first).chain(second) {
+            if !items.contains(&id) {
+                items.push(id);
+            }
+        }
+    }
+    items
+}
+
 /// Rips the traces and vias in violations beyond `allowed` (counted per kind and net pair), never
 /// on a differential pair's nets, then lets the router close the gaps. Returns how many items were
 /// ripped.
@@ -320,36 +361,15 @@ fn repair(
     deadline_ms: i32,
     backend: &'static dyn copper_core::RouterBackend,
 ) -> usize {
-    let mut seen: BTreeMap<ViolationKey, usize> = BTreeMap::new();
-    let mut doomed = BTreeSet::new();
-    for (key, first, second) in violation_keys(board) {
-        let count = seen.entry(key.clone()).or_insert(0);
-        *count += 1;
-        if *count <= allowed.get(&key).copied().unwrap_or(0) {
-            continue;
-        }
-        tracing::debug!(
-            "repair: new {key:?} between {:?} and {:?}",
-            board.get_item(first).map(|i| (i.kind(), i.get_fixed_state())),
-            second.and_then(|id| board.get_item(id)).map(|i| (i.kind(), i.get_fixed_state()))
-        );
-        for id in std::iter::once(first).chain(second) {
-            let Some(item) = board.get_item(id) else {
-                continue;
-            };
-            let wiring = item.is_trace() || matches!(item, Item::Via(_));
-            if !wiring || item.net_nos().iter().any(|n| protected.contains(n)) {
-                continue;
-            }
-            doomed.insert(id);
-        }
-    }
-    tracing::debug!("repair: {} violations seen, {} items to rip before filtering", seen.values().sum::<usize>(), doomed.len());
-    doomed.retain(|id| {
-        board.get_item(*id).is_some_and(|i| {
-            (i.is_trace() || matches!(i, Item::Via(_))) && !i.net_nos().iter().any(|n| protected.contains(n))
+    let doomed: BTreeSet<ItemId> = new_violation_items(board, allowed)
+        .into_iter()
+        .filter(|id| {
+            board.get_item(*id).is_some_and(|item| {
+                (item.is_trace() || matches!(item, Item::Via(_)))
+                    && !item.net_nos().iter().any(|n| protected.contains(n))
+            })
         })
-    });
+        .collect();
     for &id in &doomed {
         if let Some(item) = board.get_item_mut(id) {
             item.set_fixed_state(copper_board::structure::FixedState::Unfixed);
@@ -357,9 +377,19 @@ fn repair(
         board.remove_item(id);
     }
     if !doomed.is_empty() {
+        let per_mm = board.communication.get_resolution(Unit::Mm);
+        let simplified = copper_morph::simplify_traces(board, SIMPLIFY_MM * per_mm);
+        tracing::info!("repair: {simplified} traces simplified");
         let mut quick = settings.clone();
         quick.set_run_optimizer(false);
-        let progress = copper_core::SyncProgressSink::noop();
+        // Unbounded, the via optimizer can shuffle vias on warped copper for as long as it is let.
+        if quick.opt_changed_area_ms.unwrap_or(0) <= 0 {
+            quick.opt_changed_area_ms = Some(OPT_CHANGED_AREA_MS);
+        }
+        let started = std::time::Instant::now();
+        let progress = copper_core::SyncProgressSink::new(move |event| {
+            tracing::debug!("repair {:.1} s: {event:?}", started.elapsed().as_secs_f64());
+        });
         let ctx = copper_core::Ctx {
             settings: &quick,
             cancel: copper_core::CancelToken::with_timeout(std::time::Duration::from_millis(
@@ -412,6 +442,7 @@ fn pair_metrics(board: &Board, pairs: &[(String, String)], per_mm: f64) -> serde
     for (p, n) in pairs {
         let (a, b) = (traces(p), traces(n));
         let mut gap = f64::INFINITY;
+        let mut at = FloatPoint::new(0.0, 0.0);
         for (la, wa, pa) in &a {
             for (lb, wb, pb) in &b {
                 if la != lb {
@@ -419,7 +450,11 @@ fn pair_metrics(board: &Board, pairs: &[(String, String)], per_mm: f64) -> serde
                 }
                 for sa in pa.windows(2) {
                     for sb in pb.windows(2) {
-                        gap = gap.min(segment_distance(sa[0], sa[1], sb[0], sb[1]) - wa - wb);
+                        let g = segment_distance(sa[0], sa[1], sb[0], sb[1]) - wa - wb;
+                        if g < gap {
+                            gap = g;
+                            at = FloatPoint::new((sa[0].x + sa[1].x) / 2.0, (sa[0].y + sa[1].y) / 2.0);
+                        }
                     }
                 }
             }
@@ -429,6 +464,7 @@ fn pair_metrics(board: &Board, pairs: &[(String, String)], per_mm: f64) -> serde
             serde_json::json!({
                 "gap mm": if gap.is_finite() { ((gap / per_mm) * 1000.0).round() / 1000.0 } else { -1.0 },
                 "skew mm": (((length(&a) - length(&b)).abs() / per_mm) * 1000.0).round() / 1000.0,
+                "gap at": [at.x.round(), at.y.round()],
             }),
         );
     }
