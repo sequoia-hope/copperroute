@@ -97,7 +97,7 @@ impl RouterBackend for NudgeBackend {
         if settings.get_run_optimizer() && !halted(stop) {
             let mut finish = settings.clone();
             finish.max_passes = Some(TRIAL_PASSES);
-            let finish_stop = RouterStop::with_deadline(TRIAL_MS * 3);
+            let finish_stop = RouterStop::with_deadline(nudger.within_job(TRIAL_MS * 3).unwrap_or(0));
             let mut polished = board.clone();
             let finished = run_pipeline(&mut polished, &finish, &finish_stop, budget, progress)?;
             let open = unconnected_count(&mut polished);
@@ -196,7 +196,7 @@ impl Nudger<'_> {
     fn targeted(&mut self, board: &mut Board) {
         let mut tried: std::collections::BTreeSet<(i32, i32, i32)> = Default::default();
         for round in 0..targeted::ROUNDS {
-            if self.open == 0 {
+            if self.open == 0 || halted(self.stop) {
                 break;
             }
             let mut improved = false;
@@ -259,7 +259,8 @@ impl Nudger<'_> {
         if f64::from(step.x).hypot(f64::from(step.y)) / self.per_mm < smallest_mm {
             return None;
         }
-        let trial_stop = RouterStop::with_deadline(self.trial_ms);
+        let trial_ms = self.within_job(self.trial_ms)?;
+        let trial_stop = RouterStop::with_deadline(trial_ms);
         base_route(
             &mut trial,
             &self.trial_settings,
@@ -285,6 +286,14 @@ impl Nudger<'_> {
             open,
             violations,
         })
+    }
+
+    /// A trial's own deadline, cut to what is left of the job's; `None` once that is spent.
+    fn within_job(&self, ms: i32) -> Option<i32> {
+        let Some(left) = self.stop.remaining_ms() else {
+            return Some(ms);
+        };
+        (left > 0).then(|| ms.min(i32::try_from(left).unwrap_or(i32::MAX)))
     }
 
     fn accept(&mut self, board: &mut Board, round: usize, component: i32, found: Trial) {

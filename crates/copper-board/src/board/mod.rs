@@ -10,6 +10,7 @@ pub mod query;
 pub mod shape_trace_entries;
 pub mod snapshot;
 pub mod trace_normalize;
+pub mod watch;
 
 use item_store::ItemStore;
 use std::borrow::Cow;
@@ -154,6 +155,7 @@ impl Board {
 
     pub fn increment_revision(&mut self) {
         self.revision += 1;
+        watch::notify(self);
     }
 
     // -- the insert/remove protocol (BoardItemRepository) ----------------------------------------
@@ -195,6 +197,7 @@ impl Board {
             .expect("Board::insert_item: just inserted");
         self.trees.insert(inserted, &ctx);
         self.revision += 1;
+        watch::notify(self);
         id
     }
 
@@ -214,6 +217,7 @@ impl Board {
         let removed = self.items.remove(&id);
         self.journal_remove(id, removed.as_ref());
         self.revision += 1;
+        watch::notify(self);
         true
     }
 
@@ -875,6 +879,7 @@ impl Board {
         self.trees.insert(&mut item, &ctx);
         self.items.insert(id, item);
         self.revision += 1;
+        watch::notify(self);
         true
     }
 

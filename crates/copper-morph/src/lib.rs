@@ -19,6 +19,6 @@ pub use diffuse::{DiffuseOptions, DiffuseReport, airline_demand, apply_moves, di
 pub use dipole::{Dipole, dipole_targets};
 pub use relax::{NetPair, RelaxReport, relax_clearance, simplify_traces, subdivide_traces};
 pub use reshape::{PartMove, ReshapeReport, nudge_parts, reshape_step};
-pub use oracle::{Conflict, MoveOracle, pinned_by_fixed_copper, scale};
+pub use oracle::{Conflict, MoveOracle, pinned_by_fixed_copper, place_by_hand, scale};
 pub use settle::{MoveKind, PartOutcome, SettleOptions, SettleReport};
 pub use warp::WarpField;

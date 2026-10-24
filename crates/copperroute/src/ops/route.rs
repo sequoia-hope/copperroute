@@ -62,6 +62,9 @@ pub struct RouteRequest {
     pub lock: Vec<String>,
     /// Nets whose fixed wiring the router may rip and reroute, or `all`.
     pub retire_fixed: Vec<String>,
+    /// Parts to put at a position in millimetres before routing, by reference.
+    pub place: Vec<(String, f64, f64)>,
+    pub live: Option<std::sync::Arc<crate::commands::live::LiveStream>>,
 }
 
 pub struct RouteOutcome {
@@ -115,6 +118,7 @@ pub fn route(request: RouteRequest) -> Result<RouteOutcome, OpError> {
     for &id in &locked {
         board.components.get_mut(id).position_fixed = true;
     }
+    place(&mut board, &request.place, &mut warnings);
     let designed = super::fixed_wiring::system_fixed_wiring(&board);
     let retired = super::load::retire_fixed(&mut board, &request.retire_fixed).map_err(OpError::Input)?;
     if retired > 0 {
@@ -153,7 +157,19 @@ pub fn route(request: RouteRequest) -> Result<RouteOutcome, OpError> {
     let guard = request
         .memory_ceiling
         .map(|ceiling| memory_guard(ceiling, &ctx.cancel));
+    if let Some(live) = &request.live {
+        live.header(&board);
+    }
     let result = RoutingPipeline::run(&mut board, &ctx)?;
+    if let Some(live) = &request.live {
+        live.done(
+            &board,
+            serde_json::json!({
+                "passes": result.pipeline.router_passes_completed,
+                "stopped": result.stop_reason.map(|r| format!("{r:?}")),
+            }),
+        );
+    }
     if let Some(warning) = guard.and_then(|guard| memory_warning(&guard)) {
         warnings.push(warning);
     }
@@ -194,6 +210,28 @@ pub fn route(request: RouteRequest) -> Result<RouteOutcome, OpError> {
         visualization,
         warnings,
     })
+}
+
+/// Moves each part so its origin lands at the position given, as `copper_morph::place_by_hand`.
+fn place(board: &mut copper_board::Board, place: &[(String, f64, f64)], warnings: &mut Vec<String>) {
+    let per_mm = board.communication.get_resolution(copper_board::structure::Unit::Mm);
+    for (name, x, y) in place {
+        let Some((id, at)) = board
+            .components
+            .get_by_name(name)
+            .and_then(|c| c.get_location().map(|at| (c.id, at.to_float())))
+        else {
+            warnings.push(format!("--place {name}: no such part on the board"));
+            continue;
+        };
+        let by = copper_geometry::IntVector::new(
+            (x * per_mm - at.x).round() as i32,
+            (y * per_mm - at.y).round() as i32,
+        );
+        if !copper_morph::place_by_hand(board, id, &by) {
+            warnings.push(format!("--place {name}: the part could not be moved"));
+        }
+    }
 }
 
 fn memory_guard(ceiling: u64, cancel: &CancelToken) -> MemoryGuard {

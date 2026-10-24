@@ -439,6 +439,26 @@ pub fn pinned_by_fixed_copper(board: &Board, component_id: i32) -> bool {
         .any(|(_, copper)| !board.get_item(*copper).is_some_and(Item::is_routable))
 }
 
+/// A person's move: the part goes where it is put, unchecked, and every wire on its pins, fixed
+/// ones too, is ripped for the router to lay again.
+pub fn place_by_hand(board: &mut Board, component_id: i32, by: &IntVector) -> bool {
+    let members = group_items(board, &[component_id]);
+    let mut wires = BTreeSet::new();
+    for (_, copper) in attached_copper(board, &members) {
+        wires.insert(copper);
+        wires.extend(board.connection_items(copper, StopConnectionOption::None));
+    }
+    for id in wires {
+        if let Some(item) = board.get_item_mut(id)
+            && (item.is_trace() || matches!(item, Item::Via(_)))
+        {
+            item.set_fixed_state(copper_board::structure::FixedState::Unfixed);
+        }
+    }
+    let oracle = MoveOracle { guard: 0.0, routable_copper_is_soft: true, fixed_copper_bends: false };
+    oracle.translate_group(board, &[component_id], by)
+}
+
 fn attached_copper(board: &Board, members: &BTreeSet<ItemId>) -> Vec<(ItemId, ItemId)> {
     let mut attached = Vec::new();
     for &id in members {

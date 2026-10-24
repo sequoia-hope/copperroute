@@ -177,6 +177,7 @@ pub(crate) fn capture_maze_step(
     element: &MazeListElement,
     queue_len: usize,
 ) {
+    crate::live::maze_step(board, engine, element, queue_len);
     if ACTIVE_RECORDERS.load(Ordering::Relaxed) == 0 {
         return;
     }

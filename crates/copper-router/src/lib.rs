@@ -4,6 +4,7 @@ pub mod arena;
 pub mod autoroute;
 pub mod board_ext;
 pub mod error;
+pub mod live;
 pub mod pipeline;
 pub mod score;
 pub mod visualization;
@@ -37,6 +38,7 @@ pub use score::{
     BoardStatisticsFanout, BoardStatisticsItems, BoardStatisticsLayers, BoardStatisticsNets,
     BoardStatisticsPads, BoardStatisticsTraces, BoardStatisticsVias, Rectangle2DFloat,
 };
+pub use live::{MazeProbe, MazeWatchGuard, MazeWatcher, watch_maze};
 pub use visualization::{
     RoutingVisualizationGuard, RoutingVisualizationOptions, RoutingVisualizationSummary,
     start_routing_visualization,

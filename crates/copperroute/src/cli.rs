@@ -89,6 +89,16 @@ pub struct RouteArgs {
     /// Parts placement tools must not move, by reference: --lock J1,U7. Repeatable.
     #[arg(long, value_delimiter = ',', value_name = "REF")]
     pub lock: Vec<String>,
+    /// Put a part's origin at x,y millimetres before routing: --place U3=12.5,40. Repeatable.
+    #[arg(long, value_name = "REF=X,Y", value_parser = parse_place)]
+    pub place: Vec<(String, f64, f64)>,
+    /// Stream the board as it changes, as newline-delimited JSON, to this file or `-` for
+    /// standard output. With `-`, a line `stop` on standard input stops the run.
+    #[arg(long, value_name = "PATH")]
+    pub live: Option<PathBuf>,
+    /// Frames per second for --live.
+    #[arg(long, default_value_t = 60.0)]
+    pub live_fps: f64,
     /// Write an SVG of the board after every nudge kept, with frames.jsonl, into this empty
     /// directory.
     #[arg(long)]
@@ -561,4 +571,11 @@ pub struct BandArgs {
     /// directory.
     #[arg(long)]
     pub frames: Option<PathBuf>,
+}
+
+fn parse_place(value: &str) -> Result<(String, f64, f64), String> {
+    let (name, at) = value.split_once('=').ok_or("expected REF=X,Y")?;
+    let (x, y) = at.split_once(',').ok_or("expected REF=X,Y")?;
+    let number = |v: &str| v.trim().parse::<f64>().map_err(|e| format!("{v}: {e}"));
+    Ok((name.to_string(), number(x)?, number(y)?))
 }

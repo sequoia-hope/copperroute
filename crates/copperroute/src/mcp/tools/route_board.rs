@@ -38,6 +38,8 @@ pub fn run(
         backend: &copper_core::MazeBackend,
         lock: Vec::new(),
         retire_fixed: Vec::new(),
+        place: Vec::new(),
+        live: None,
     })
     .map_err(super::rpc_error)?;
     outcome.job.id = super::mint_job_id();

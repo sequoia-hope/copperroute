@@ -42,16 +42,36 @@ pub fn run(cli: &Cli, args: &RouteArgs, memory_ceiling: Option<u64>) -> ExitCode
         },
         None => None,
     };
+    let cancel = copper_core::CancelToken::new();
+    let watching = match args.live.as_deref() {
+        Some(path) => match live_output(path, &cancel) {
+            Ok(out) => Some(super::live::start(out, args.live_fps)),
+            Err(error) => {
+                tracing::error!("Couldn't open --live {}: {error}", path.display());
+                return ExitCode::Failure;
+            }
+        },
+        None => None,
+    };
+    let progress = match &watching {
+        Some(watching) => {
+            let stream = watching.stream.clone();
+            SyncProgressSink::new(move |event| stream.event(serde_json::json!(format!("{event:?}"))))
+        }
+        None => SyncProgressSink::noop(),
+    };
     let outcome = match route(RouteRequest {
         load,
         output: OutputTarget::File(args.output.clone()),
-        cancel: copper_core::CancelToken::new(),
-        progress: SyncProgressSink::noop(),
+        cancel,
+        progress,
         visualize,
         memory_ceiling,
         backend: args.backend,
         lock: args.lock.clone(),
         retire_fixed: args.retire_fixed.clone(),
+        place: args.place.clone(),
+        live: watching.as_ref().map(|w| w.stream.clone()),
     }) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -93,6 +113,23 @@ pub fn run(cli: &Cli, args: &RouteArgs, memory_ceiling: Option<u64>) -> ExitCode
     };
     write_manifest(args, &outcome, written, exit_code);
     exit_code
+}
+
+fn live_output(path: &Path, cancel: &copper_core::CancelToken) -> std::io::Result<Box<dyn std::io::Write + Send>> {
+    if path != Path::new("-") {
+        return Ok(Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)));
+    }
+    let cancel = cancel.clone();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lines() {
+            match line {
+                Ok(line) if line.trim() == "stop" => cancel.cancel(),
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+    });
+    Ok(Box::new(std::io::stdout()))
 }
 
 fn write_session(outcome: &RouteOutcome, path: &Path) -> bool {

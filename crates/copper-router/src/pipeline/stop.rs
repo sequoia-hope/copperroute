@@ -166,6 +166,17 @@ impl RouterStop {
         self.is_stop_requested()
     }
 
+    /// Milliseconds left before the deadline, if there is one; negative once it has passed.
+    pub fn remaining_ms(&self) -> Option<i64> {
+        let deadline = self.deadline.as_ref()?.deadline()?;
+        let now = web_time::Instant::now();
+        Some(if deadline >= now {
+            i64::try_from((deadline - now).as_millis()).unwrap_or(i64::MAX)
+        } else {
+            -i64::try_from((now - deadline).as_millis()).unwrap_or(i64::MAX)
+        })
+    }
+
     pub fn poll_cancel(&self) {
         if let Some(poll) = self.cancel_poll.as_ref() {
             poll(self);
