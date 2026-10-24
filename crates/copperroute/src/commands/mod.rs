@@ -1,3 +1,4 @@
+pub mod band;
 pub mod blame;
 pub mod drc;
 pub mod frames;

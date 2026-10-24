@@ -1,4 +1,4 @@
-//! Pulling copper apart after a warp: every trace corner not holding a connection is pushed away
+//! Pulling copper apart after a warp, and pulling it taut: every trace corner not holding a connection is pushed away
 //! from other nets' copper that is closer than the clearance, a little at a time, so squeezed
 //! bundles spread into free space nearby. Pins and vias stay where they are. Copper that crosses
 //! other copper is left for rip-up: no push can tell which side it belongs on.
@@ -13,6 +13,7 @@ use copper_geometry::{FloatPoint, IntPoint, Point, Polyline};
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RelaxReport {
     pub traces_moved: usize,
+    pub vias_moved: usize,
     pub overlaps_before: usize,
     pub overlaps_after: usize,
     /// The net pairs found too close before relaxing, the edge as net -1, with the smallest
@@ -29,7 +30,11 @@ fn net_pair(a: &[i32], b: &[i32]) -> NetPair {
 const CELL_MM: f64 = 1.0;
 const MAX_STEP_MM: f64 = 0.05;
 const SMOOTHING: f64 = 0.1;
-const SLACK_MM: f64 = 0.005;
+const SLACK_MM: f64 = 0.01;
+/// Under tension, contact rounds per pull, so the clearances win.
+const CONTACT_PASSES: usize = 3;
+/// Contact-only rounds that end a pull.
+const SETTLE_ROUNDS: usize = 30;
 
 struct Wire {
     id: ItemId,
@@ -45,6 +50,8 @@ struct Wire {
 }
 
 struct Blob {
+    /// The free via this shape belongs to, which moves it.
+    via: Option<usize>,
     layer: usize,
     nets: Vec<i32>,
     class: usize,
@@ -52,36 +59,73 @@ struct Blob {
     centre: FloatPoint,
 }
 
-/// Relaxes for `iterations` rounds. `outline`, when given, pushes copper back inside it by the
+struct ViaNode {
+    id: ItemId,
+    joint: usize,
+}
+
+/// Relaxes for `iterations` rounds. With `tension`, every trace is also a rubber band: each round
+/// it first pulls taut (each segment draws its ends together by that fraction of its length) and
+/// then the clearances push it back, so it ends hugging what it wraps around. `outline`, when given, pushes copper back inside it by the
 /// edge clearance. Net pairs in `tolerated` may come as close as the distance given and no
 /// closer: pushing copper off a pin it was always necked down onto only shoves it into its other
-/// neighbours.
+/// neighbours. With `free_vias`, vias move too, as nodes joining the traces that meet them.
 pub fn relax_clearance(
     board: &mut Board,
     iterations: usize,
     outline: Option<&[FloatPoint]>,
     tolerated: &BTreeMap<NetPair, f64>,
+    tension: f64,
+    free_vias: bool,
 ) -> RelaxReport {
     let per_mm = board.communication.get_resolution(Unit::Mm);
     let cell = CELL_MM * per_mm;
     let max_step = MAX_STEP_MM * per_mm;
     let slack = SLACK_MM * per_mm;
-    let (mut wires, blobs, joints) = collect(board);
+    let (mut wires, blobs, joints, vias) = collect(board, free_vias);
+    let mut offset = vec![(0.0, 0.0); vias.len()];
     let edge_class = board.get_items().find_map(|item| match item {
         Item::BoardOutline(_) => Some(item.clearance_class()),
         _ => None,
     });
     let start: Vec<Vec<FloatPoint>> = wires.iter().map(|w| w.points.clone()).collect();
 
-    let mut blob_cells: HashMap<(i64, i64, usize), Vec<usize>> = HashMap::new();
-    for (b, blob) in blobs.iter().enumerate() {
-        for key in cells_of(&blob.polygon, 0.0, cell, blob.layer) {
-            blob_cells.entry(key).or_default().push(b);
-        }
-    }
-
     let mut report = RelaxReport::default();
-    for round in 0..=iterations {
+    let pulling = if tension > 0.0 { iterations * CONTACT_PASSES } else { 0 };
+    let total = if tension > 0.0 { pulling + SETTLE_ROUNDS } else { iterations };
+    for round in 0..=total {
+        if tension > 0.0 && round > 0 && round <= pulling && round % CONTACT_PASSES == 0 {
+            let mut pull: Vec<Vec<(f64, f64)>> = wires.iter().map(|w| vec![(0.0, 0.0); w.points.len()]).collect();
+            for (wire, pull) in wires.iter().zip(&mut pull) {
+                for s in 0..wire.points.len().saturating_sub(1) {
+                    let (a, b) = (wire.points[s], wire.points[s + 1]);
+                    let (dx, dy) = (tension * (b.x - a.x), tension * (b.y - a.y));
+                    pull[s].0 += dx;
+                    pull[s].1 += dy;
+                    pull[s + 1].0 -= dx;
+                    pull[s + 1].1 -= dy;
+                }
+            }
+            let moved = apply(&mut wires, &pull, None, joints, max_step, 0.0);
+            follow(&vias, &mut offset, &moved);
+        }
+        let polygons: Vec<Vec<FloatPoint>> = blobs
+            .iter()
+            .map(|blob| match blob.via {
+                Some(v) => blob.polygon.iter().map(|p| FloatPoint::new(p.x + offset[v].0, p.y + offset[v].1)).collect(),
+                None => Vec::new(),
+            })
+            .collect();
+        let polygon = |b: usize| -> &[FloatPoint] {
+            if blobs[b].via.is_some() { &polygons[b] } else { &blobs[b].polygon }
+        };
+        let mut blob_cells: HashMap<(i64, i64, usize), Vec<usize>> = HashMap::new();
+        for (b, blob) in blobs.iter().enumerate() {
+            for key in cells_of(polygon(b), 0.0, cell, blob.layer) {
+                blob_cells.entry(key).or_default().push(b);
+            }
+        }
+        let mut via_push = vec![(0.0, 0.0); joints];
         let mut segment_cells: HashMap<(i64, i64, usize), Vec<(usize, usize)>> = HashMap::new();
         for (w, wire) in wires.iter().enumerate() {
             for s in 0..wire.points.len().saturating_sub(1) {
@@ -148,7 +192,7 @@ pub fn relax_clearance(
                     let need = wire.half
                         + f64::from(board.clearance_value(wire.class, blob.class, wire.layer))
                         + slack;
-                    let (d, ta, pa, pb) = to_polygon(a0, a1, &blob.polygon);
+                    let (d, ta, pa, pb) = to_polygon(a0, a1, polygon(b));
                     if d >= need {
                         continue;
                     }
@@ -161,15 +205,70 @@ pub fn relax_clearance(
                         continue;
                     }
                     overlaps += 1;
+                    let centre = blob.via.map_or(blob.centre, |v| FloatPoint::new(blob.centre.x + offset[v].0, blob.centre.y + offset[v].1));
                     let (n, depth) = if d > 0.0 {
                         (((pa.x - pb.x) / d, (pa.y - pb.y) / d), need - d)
                     } else {
-                        let (dx, dy) = (pa.x - blob.centre.x, pa.y - blob.centre.y);
+                        let (dx, dy) = (pa.x - centre.x, pa.y - centre.y);
                         let len = dx.hypot(dy).max(1.0);
                         ((dx / len, dy / len), need)
                     };
-                    add(&mut push[w], s, ta, n, depth);
+                    match blob.via {
+                        Some(v) => {
+                            add(&mut push[w], s, ta, n, depth / 2.0);
+                            via_push[vias[v].joint].0 -= n.0 * depth / 2.0;
+                            via_push[vias[v].joint].1 -= n.1 * depth / 2.0;
+                        }
+                        None => add(&mut push[w], s, ta, n, depth),
+                    }
                 }
+            }
+        }
+        for (b, blob) in blobs.iter().enumerate() {
+            let Some(v) = blob.via else {
+                continue;
+            };
+            let mine = polygon(b);
+            let near: BTreeSet<usize> = cells_of(mine, 0.0, cell, blob.layer)
+                .filter_map(|key| blob_cells.get(&key))
+                .flatten()
+                .copied()
+                .filter(|&o| o != b && !blobs[o].nets.iter().any(|n| blob.nets.contains(n)))
+                .collect();
+            for o in near {
+                let other = &blobs[o];
+                let need = f64::from(board.clearance_value(blob.class, other.class, blob.layer)) + slack;
+                let theirs = polygon(o);
+                let mut best = (f64::INFINITY, mine[0], mine[0]);
+                for (i, a) in mine.iter().enumerate() {
+                    let (d, _, pa, pb) = to_polygon(*a, mine[(i + 1) % mine.len()], theirs);
+                    if d < best.0 {
+                        best = (d, pa, pb);
+                    }
+                }
+                let (d, pa, pb) = best;
+                if d >= need {
+                    continue;
+                }
+                let key = net_pair(&blob.nets, &other.nets);
+                if round == 0 {
+                    note(&mut report.close_pairs, &key, d);
+                }
+                let need = tolerated.get(&key).map_or(need, |floor| need.min(*floor));
+                if d >= need {
+                    continue;
+                }
+                overlaps += 1;
+                let (n, depth) = if d > 0.0 {
+                    (((pa.x - pb.x) / d, (pa.y - pb.y) / d), need - d)
+                } else {
+                    let (dx, dy) = (blob.centre.x + offset[v].0 - other.centre.x, blob.centre.y + offset[v].1 - other.centre.y);
+                    let len = dx.hypot(dy).max(1.0);
+                    ((dx / len, dy / len), need)
+                };
+                let share = if other.via.is_some() { 0.5 } else { 1.0 };
+                via_push[vias[v].joint].0 += n.0 * depth * share;
+                via_push[vias[v].joint].1 += n.1 * depth * share;
             }
         }
         if let (Some(outline), Some(edge_class)) = (outline, edge_class) {
@@ -206,52 +305,119 @@ pub fn relax_clearance(
             report.overlaps_before = overlaps;
         }
         report.overlaps_after = overlaps;
-        if round == iterations || overlaps == 0 {
+        if round == total || (overlaps == 0 && round >= pulling) {
             break;
         }
-        let mut joint_push = vec![(0.0, 0.0); joints];
-        for (wire, push) in wires.iter().zip(&push) {
-            for (joint, p) in wire.joint.iter().zip(push) {
-                if let Some(j) = joint {
-                    joint_push[*j].0 += p.0;
-                    joint_push[*j].1 += p.1;
-                }
-            }
-        }
-        let cap = |(dx, dy): (f64, f64)| {
-            let len = dx.hypot(dy);
-            if len > max_step { (dx * max_step / len, dy * max_step / len) } else { (dx, dy) }
-        };
-        for (wire, push) in wires.iter_mut().zip(&push) {
-            let before = wire.points.clone();
-            for i in 0..wire.points.len() {
-                if !wire.movable[i] {
-                    continue;
-                }
-                let (dx, dy) = match wire.joint[i] {
-                    Some(j) => cap(joint_push[j]),
-                    None => {
-                        let (dx, dy) = push[i];
-                        if dx == 0.0 && dy == 0.0 {
-                            continue;
-                        }
-                        let mid = FloatPoint::new((before[i - 1].x + before[i + 1].x) / 2.0, (before[i - 1].y + before[i + 1].y) / 2.0);
-                        cap((dx + SMOOTHING * (mid.x - before[i].x), dy + SMOOTHING * (mid.y - before[i].y)))
-                    }
-                };
-                wire.points[i] = FloatPoint::new(before[i].x + dx, before[i].y + dy);
+        let moved = apply(&mut wires, &push, Some(&via_push), joints, max_step, SMOOTHING);
+        follow(&vias, &mut offset, &moved);
+    }
+
+    write_back(board, wires, &start, &vias, &offset, &mut report);
+    report
+}
+
+/// Moves each movable corner by its push (shared joints by the sum over their corners and
+/// `extra`), at most `max_step`; pushed corners off a joint also smooth toward their neighbours'
+/// midpoint. Returns how far each joint moved.
+fn apply(
+    wires: &mut [Wire],
+    push: &[Vec<(f64, f64)>],
+    extra: Option<&[(f64, f64)]>,
+    joints: usize,
+    max_step: f64,
+    smoothing: f64,
+) -> Vec<(f64, f64)> {
+    let mut joint_push = extra.map_or_else(|| vec![(0.0, 0.0); joints], <[_]>::to_vec);
+    for (wire, push) in wires.iter().zip(push) {
+        for (joint, p) in wire.joint.iter().zip(push) {
+            if let Some(j) = joint {
+                joint_push[*j].0 += p.0;
+                joint_push[*j].1 += p.1;
             }
         }
     }
+    let cap = |(dx, dy): (f64, f64)| {
+        let len = dx.hypot(dy);
+        if len > max_step { (dx * max_step / len, dy * max_step / len) } else { (dx, dy) }
+    };
+    let moved: Vec<(f64, f64)> = joint_push.iter().map(|p| cap(*p)).collect();
+    for (wire, push) in wires.iter_mut().zip(push) {
+        let before = wire.points.clone();
+        for i in 0..wire.points.len() {
+            if !wire.movable[i] {
+                continue;
+            }
+            let (dx, dy) = match wire.joint[i] {
+                Some(j) => moved[j],
+                None => {
+                    let (dx, dy) = push[i];
+                    if dx == 0.0 && dy == 0.0 {
+                        continue;
+                    }
+                    let mid = FloatPoint::new((before[i - 1].x + before[i + 1].x) / 2.0, (before[i - 1].y + before[i + 1].y) / 2.0);
+                    cap((dx + smoothing * (mid.x - before[i].x), dy + smoothing * (mid.y - before[i].y)))
+                }
+            };
+            wire.points[i] = FloatPoint::new(before[i].x + dx, before[i].y + dy);
+        }
+    }
+    moved
+}
 
+fn follow(vias: &[ViaNode], offset: &mut [(f64, f64)], moved: &[(f64, f64)]) {
+    for (via, offset) in vias.iter().zip(offset) {
+        offset.0 += moved[via.joint].0;
+        offset.1 += moved[via.joint].1;
+    }
+}
+
+/// Puts moved copper back. Traces come out before their vias move, since moving a via with
+/// traces on it would draw new copper from its old centre to its new one.
+fn write_back(
+    board: &mut Board,
+    wires: Vec<Wire>,
+    start: &[Vec<FloatPoint>],
+    vias: &[ViaNode],
+    offset: &[(f64, f64)],
+    report: &mut RelaxReport,
+) {
+    let shifts: Vec<(i32, i32)> = offset.iter().map(|(dx, dy)| (dx.round() as i32, dy.round() as i32)).collect();
+    let moving: BTreeSet<usize> = vias.iter().zip(&shifts).filter(|(_, by)| **by != (0, 0)).map(|(v, _)| v.joint).collect();
+    let mut lifted = Vec::new();
     for (wire, start) in wires.into_iter().zip(start) {
-        let moved = wire
-            .points
-            .iter()
-            .zip(&start)
-            .any(|(p, q)| (p.x - q.x).hypot(p.y - q.y) >= 0.5);
+        let moved = wire.points.iter().zip(start).any(|(p, q)| (p.x - q.x).hypot(p.y - q.y) >= 0.5)
+            || wire.joint.iter().flatten().any(|j| moving.contains(j));
         if !moved {
             continue;
+        }
+        if let Some(item) = board.get_item_mut(wire.id) {
+            item.set_fixed_state(FixedState::Unfixed);
+        }
+        board.remove_item(wire.id);
+        lifted.push(wire);
+    }
+    let mut centres: HashMap<usize, FloatPoint> = HashMap::new();
+    for (via, by) in vias.iter().zip(&shifts) {
+        if *by == (0, 0) {
+            continue;
+        }
+        let Some(Point::Int(old)) = board.drill_center(via.id) else {
+            continue;
+        };
+        let vector = copper_geometry::Vector::Int(copper_geometry::IntVector::new(by.0, by.1));
+        let centre = if matches!(board.move_item_by(via.id, &vector), Ok(true)) {
+            report.vias_moved += 1;
+            FloatPoint::new(f64::from(old.x + by.0), f64::from(old.y + by.1))
+        } else {
+            old.to_float()
+        };
+        centres.insert(via.joint, centre);
+    }
+    for mut wire in lifted {
+        for (p, joint) in wire.points.iter_mut().zip(&wire.joint) {
+            if let Some(centre) = joint.and_then(|j| centres.get(&j)) {
+                *p = *centre;
+            }
         }
         let mut points: Vec<Point> = Vec::with_capacity(wire.points.len());
         for p in &wire.points {
@@ -261,6 +427,41 @@ pub fn relax_clearance(
             }
         }
         if points.len() < 2 {
+            continue;
+        }
+        board.insert_trace_without_cleaning(
+            Polyline::from_points(&points),
+            wire.layer,
+            wire.half as i32,
+            wire.nets,
+            wire.class,
+            wire.fixed,
+        );
+        report.traces_moved += 1;
+    }
+}
+
+/// Splits trace segments longer than `max_len` (board units), so a band has corners to bend at.
+pub fn subdivide_traces(board: &mut Board, max_len: f64) -> usize {
+    let (wires, _, _, _) = collect(board, false);
+    let mut split = 0;
+    for wire in wires {
+        let mut points: Vec<Point> = Vec::new();
+        for pair in wire.points.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let pieces = ((a.x - b.x).hypot(a.y - b.y) / max_len).ceil().max(1.0) as usize;
+            for k in 0..pieces {
+                let t = k as f64 / pieces as f64;
+                let q = Point::Int(IntPoint::new((a.x + (b.x - a.x) * t).round() as i32, (a.y + (b.y - a.y) * t).round() as i32));
+                if points.last() != Some(&q) {
+                    points.push(q);
+                }
+            }
+        }
+        if let Some(last) = wire.points.last() {
+            points.push(Point::Int(IntPoint::new(last.x.round() as i32, last.y.round() as i32)));
+        }
+        if points.len() <= wire.points.len() {
             continue;
         }
         if let Some(item) = board.get_item_mut(wire.id) {
@@ -275,16 +476,16 @@ pub fn relax_clearance(
             wire.class,
             wire.fixed,
         );
-        report.traces_moved += 1;
+        split += 1;
     }
-    report
+    split
 }
 
 /// Drops trace corners that sit within `tolerance` (board units) of the line through their
 /// neighbours, keeping every corner that holds a connection. A warped trace keeps a corner every
 /// half millimetre, which makes the router's trace insertion and pull-tight crawl.
 pub fn simplify_traces(board: &mut Board, tolerance: f64) -> usize {
-    let (wires, _, _) = collect(board);
+    let (wires, _, _, _) = collect(board, false);
     let mut simplified = 0;
     for wire in wires {
         let mut keep = vec![false; wire.points.len()];
@@ -344,12 +545,29 @@ fn douglas_peucker(points: &[FloatPoint], first: usize, last: usize, tolerance: 
     }
 }
 
-fn collect(board: &Board) -> (Vec<Wire>, Vec<Blob>, usize) {
+fn collect(board: &Board, free_vias: bool) -> (Vec<Wire>, Vec<Blob>, usize, Vec<ViaNode>) {
     let ctx = board.ctx();
     let mut wires = Vec::new();
     let mut blobs = Vec::new();
     let mut held: BTreeSet<(i32, i32)> = BTreeSet::new();
     let mut ends: HashMap<(i32, i32, usize), usize> = HashMap::new();
+    let mut vias = Vec::new();
+    let mut joints = 0;
+    for item in board.get_items() {
+        if !(free_vias && matches!(item, Item::Via(_)) && !item.is_user_fixed()) {
+            continue;
+        }
+        let Some(Point::Int(c)) = board.drill_center(item.id()) else {
+            continue;
+        };
+        let joint = joints;
+        joints += 1;
+        for layer in item.first_layer(&ctx)..=item.last_layer(&ctx) {
+            ends.insert((c.x, c.y, layer), joint);
+        }
+        vias.push(ViaNode { id: item.id(), joint });
+    }
+    let free: HashMap<ItemId, usize> = vias.iter().enumerate().map(|(v, via)| (via.id, v)).collect();
     for item in board.get_items() {
         match item {
             Item::Trace(trace) => {
@@ -359,8 +577,10 @@ fn collect(board: &Board) -> (Vec<Wire>, Vec<Blob>, usize) {
                     .collect();
                 for end in [points.first(), points.last()].into_iter().flatten() {
                     let key = (end.x.round() as i32, end.y.round() as i32, trace.get_layer());
-                    let next = ends.len();
-                    ends.entry(key).or_insert(next);
+                    if !ends.contains_key(&key) {
+                        ends.insert(key, joints);
+                        joints += 1;
+                    }
                 }
                 wires.push(Wire {
                     id: item.id(),
@@ -375,7 +595,8 @@ fn collect(board: &Board) -> (Vec<Wire>, Vec<Blob>, usize) {
                 });
             }
             _ if item.is_drill_item() => {
-                if let Some(Point::Int(c)) = board.drill_center(item.id()) {
+                let via = free.get(&item.id()).copied();
+                if let (None, Some(Point::Int(c))) = (via, board.drill_center(item.id())) {
                     held.insert((c.x, c.y));
                 }
                 let first = item.first_layer(&ctx);
@@ -393,6 +614,7 @@ fn collect(board: &Board) -> (Vec<Wire>, Vec<Blob>, usize) {
                         polygon.iter().map(|p| p.y).sum::<f64>() / n,
                     );
                     blobs.push(Blob {
+                        via,
                         layer: first + i,
                         nets: item.net_nos().to_vec(),
                         class: item.clearance_class(),
@@ -404,12 +626,30 @@ fn collect(board: &Board) -> (Vec<Wire>, Vec<Blob>, usize) {
             _ => {}
         }
     }
+    let mut meeting: HashMap<usize, usize> = HashMap::new();
     for wire in &mut wires {
         let keys: Vec<(i32, i32)> = wire.points.iter().map(|p| (p.x.round() as i32, p.y.round() as i32)).collect();
-        wire.movable = keys.iter().map(|k| !held.contains(k)).collect();
         wire.joint = keys.iter().map(|&(x, y)| ends.get(&(x, y, wire.layer)).copied()).collect();
+        for j in wire.joint.iter().flatten() {
+            *meeting.entry(*j).or_insert(0) += 1;
+        }
+        wire.movable = keys.iter().map(|k| !held.contains(k)).collect();
     }
-    (wires, blobs, ends.len())
+    // An end that meets no other trace and no free via ends on a pad or a pour, whatever its
+    // centre: it must stay put.
+    let via_joints: BTreeSet<usize> = vias.iter().map(|v| v.joint).collect();
+    for wire in &mut wires {
+        let last = wire.points.len() - 1;
+        for i in [0, last] {
+            if let Some(j) = wire.joint[i]
+                && meeting[&j] < 2
+                && !via_joints.contains(&j)
+            {
+                wire.movable[i] = false;
+            }
+        }
+    }
+    (wires, blobs, joints, vias)
 }
 
 fn note(pairs: &mut BTreeMap<NetPair, f64>, key: &NetPair, distance: f64) {
@@ -417,7 +657,10 @@ fn note(pairs: &mut BTreeMap<NetPair, f64>, key: &NetPair, distance: f64) {
     *entry = entry.min(distance);
 }
 
+/// Spreads a push at parameter `t` of a segment over its ends, scaled so the point at `t` itself
+/// moves the full `amount`.
 fn add(push: &mut [(f64, f64)], segment: usize, t: f64, n: (f64, f64), amount: f64) {
+    let amount = amount / ((1.0 - t).powi(2) + t.powi(2));
     for (i, weight) in [(segment, 1.0 - t), (segment + 1, t)] {
         push[i].0 += n.0 * amount * weight;
         push[i].1 += n.1 * amount * weight;

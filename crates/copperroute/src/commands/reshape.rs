@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use copper_board::{Board, ItemId};
 use copper_board::items::Item;
@@ -10,7 +11,7 @@ use serde::Deserialize;
 use crate::ExitCode;
 use crate::cli::{Cli, ReshapeArgs};
 use crate::ops::fixed_wiring;
-use crate::ops::load::{BoardSource, LoadRequest, load};
+use crate::ops::load::{BoardSource, LoadRequest, Loaded, load};
 
 #[derive(Deserialize)]
 struct Plan {
@@ -48,51 +49,11 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
         return ExitCode::UsageError;
     }
 
-    let mut request = LoadRequest::for_board(BoardSource::Path(args.input.clone()));
-    request.discover_adjacent_rules = true;
-    request.kicad_project = args.kicad_project.clone();
-    request.settings = super::overrides(cli, &args.set);
-    let mut loaded = match load(&request) {
+    let (mut loaded, original) = match load_routed(cli, &args.input, &args.ses, args.kicad_project.clone(), &args.set) {
         Ok(loaded) => loaded,
-        Err(error) => {
-            tracing::error!("{error}");
-            return ExitCode::Failure;
-        }
+        Err(code) => return code,
     };
     let board = &mut loaded.board;
-    let original = fixed_wiring::system_fixed_wiring(board);
-    let designed: BTreeSet<ItemId> = board
-        .get_items()
-        .filter(|i| i.is_trace() || matches!(i, Item::Via(_)))
-        .map(Item::id)
-        .collect();
-    if let Err(error) = fixed_wiring::apply_sidecar(&args.ses, board) {
-        tracing::error!("{error}");
-        return ExitCode::Failure;
-    }
-    let session = match std::fs::read(&args.ses) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::error!("Couldn't read {}: {error}", args.ses.display());
-            return ExitCode::Failure;
-        }
-    };
-    if let Err(error) = copper_dsn::ses_reader::read(&session[..], board, &loaded.transform) {
-        tracing::error!("Couldn't import {}: {error}", args.ses.display());
-        return ExitCode::Failure;
-    }
-    // The session reader fixes what it imports; its routing is the router's to redo, unlike
-    // wiring the design itself fixed.
-    let routed: Vec<ItemId> = board
-        .get_items()
-        .filter(|i| (i.is_trace() || matches!(i, Item::Via(_))) && !designed.contains(&i.id()))
-        .map(Item::id)
-        .collect();
-    for id in routed {
-        if let Some(item) = board.get_item_mut(id) {
-            item.unfix();
-        }
-    }
 
     let per_mm = board.communication.get_resolution(Unit::Mm);
     let scale = loaded.transform.scale_factor();
@@ -144,7 +105,7 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
     }
 
     let mut outline: Vec<FloatPoint> = plan.board_outline.iter().map(to_board).collect();
-    let tolerated = copper_morph::relax_clearance(board, 0, Some(&outline), &BTreeMap::new()).close_pairs;
+    let tolerated = copper_morph::relax_clearance(board, 0, Some(&outline), &BTreeMap::new(), 0.0, false).close_pairs;
     let mut applied: BTreeMap<i32, [f64; 3]> = BTreeMap::new();
     let pause = copper_morph::frames::pause();
     for (k, step) in plan.steps.iter().enumerate().take(last + 1) {
@@ -172,7 +133,7 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
         let report = reshape_step(board, &outline, &target, &moves, args.cell_mm, &pair_nets);
         outline = target;
         if args.relax > 0 {
-            let r = copper_morph::relax_clearance(board, args.relax, Some(&outline), &tolerated);
+            let r = copper_morph::relax_clearance(board, args.relax, Some(&outline), &tolerated, args.tension, false);
             tracing::info!(
                 "step {k}: relaxed {} traces, overlaps {} -> {}",
                 r.traces_moved,
@@ -215,29 +176,83 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
     }
     drop(pause);
 
-    let superseded = fixed_wiring::supersede(board, &original, &loaded.transform);
-    let mut bytes = Vec::new();
     let outline_mm: Vec<[f64; 2]> = plan.steps[last].outline.clone();
-    if let Err(error) = copper_core::save_as_specctra_session_ses(
-        board,
-        &loaded.transform,
-        &loaded.job.name,
-        &mut bytes,
-    )
-    .map_err(|e| e.to_string())
-    .and_then(|()| std::fs::write(&args.output, &bytes).map_err(|e| e.to_string()))
-    .and_then(|()| fixed_wiring::write_sidecar(&args.output, &superseded).map_err(|e| e.to_string()))
-    .and_then(|()| {
-        let text = serde_json::json!({ "step": last, "label": plan.steps[last].label, "outline_mm": outline_mm });
-        std::fs::write(args.output.with_extension("outline.json"), text.to_string()).map_err(|e| e.to_string())
-    }) {
+    let text = serde_json::json!({ "step": last, "label": plan.steps[last].label, "outline_mm": outline_mm });
+    if let Err(error) = write_routed(&mut loaded, &original, &args.output)
+        .and_then(|()| std::fs::write(args.output.with_extension("outline.json"), text.to_string()).map_err(|e| e.to_string()))
+    {
         tracing::error!("Couldn't write {}: {error}", args.output.display());
         return ExitCode::Failure;
     }
     ExitCode::Ok
 }
 
-fn violation_counts(board: &mut Board) -> BTreeMap<String, usize> {
+/// Loads a board with a routed session on it, the session's routing unfixed so it can move.
+/// Also returns the design's own fixed wiring, which `write_routed` needs.
+pub(super) fn load_routed(
+    cli: &Cli,
+    input: &Path,
+    ses: &Path,
+    kicad_project: Option<PathBuf>,
+    set: &[String],
+) -> Result<(Loaded, BTreeSet<fixed_wiring::Wiring>), ExitCode> {
+    let mut request = LoadRequest::for_board(BoardSource::Path(input.to_path_buf()));
+    request.discover_adjacent_rules = true;
+    request.kicad_project = kicad_project;
+    request.settings = super::overrides(cli, set);
+    let mut loaded = load(&request).map_err(|error| {
+        tracing::error!("{error}");
+        ExitCode::Failure
+    })?;
+    let board = &mut loaded.board;
+    let original = fixed_wiring::system_fixed_wiring(board);
+    let designed: BTreeSet<ItemId> = board
+        .get_items()
+        .filter(|i| i.is_trace() || matches!(i, Item::Via(_)))
+        .map(Item::id)
+        .collect();
+    fixed_wiring::apply_sidecar(ses, board).map_err(|error| {
+        tracing::error!("{error}");
+        ExitCode::Failure
+    })?;
+    let session = std::fs::read(ses).map_err(|error| {
+        tracing::error!("Couldn't read {}: {error}", ses.display());
+        ExitCode::Failure
+    })?;
+    copper_dsn::ses_reader::read(&session[..], board, &loaded.transform).map_err(|error| {
+        tracing::error!("Couldn't import {}: {error}", ses.display());
+        ExitCode::Failure
+    })?;
+    // The session reader fixes what it imports; its routing is the router's to redo, unlike
+    // wiring the design itself fixed.
+    let routed: Vec<ItemId> = board
+        .get_items()
+        .filter(|i| (i.is_trace() || matches!(i, Item::Via(_))) && !designed.contains(&i.id()))
+        .map(Item::id)
+        .collect();
+    for id in routed {
+        if let Some(item) = board.get_item_mut(id) {
+            item.unfix();
+        }
+    }
+    Ok((loaded, original))
+}
+
+/// Writes the session and its sidecar naming the design wiring it replaced.
+pub(super) fn write_routed(
+    loaded: &mut Loaded,
+    original: &BTreeSet<fixed_wiring::Wiring>,
+    output: &Path,
+) -> Result<(), String> {
+    let superseded = fixed_wiring::supersede(&mut loaded.board, original, &loaded.transform);
+    let mut bytes = Vec::new();
+    copper_core::save_as_specctra_session_ses(&loaded.board, &loaded.transform, &loaded.job.name, &mut bytes)
+        .map_err(|e| e.to_string())?;
+    std::fs::write(output, &bytes).map_err(|e| e.to_string())?;
+    fixed_wiring::write_sidecar(output, &superseded).map_err(|e| e.to_string())
+}
+
+pub(super) fn violation_counts(board: &mut Board) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for v in copper_drc::DesignRulesChecker::new(board).get_all_violations() {
         let kind = format!("{:?}", v.kind);
@@ -247,7 +262,7 @@ fn violation_counts(board: &mut Board) -> BTreeMap<String, usize> {
     counts
 }
 
-fn step_stats(
+pub(super) fn step_stats(
     label: &str,
     board: &mut Board,
     baseline: &BTreeMap<String, usize>,
@@ -276,9 +291,9 @@ fn step_stats(
 }
 
 /// What a violation is between, not where: kind and the nets on each side.
-type ViolationKey = (String, Vec<String>);
+pub(super) type ViolationKey = (String, Vec<String>);
 
-fn violation_keys(board: &mut Board) -> Vec<(ViolationKey, ItemId, Option<ItemId>)> {
+pub(super) fn violation_keys(board: &mut Board) -> Vec<(ViolationKey, ItemId, Option<ItemId>)> {
     let net_names = |board: &Board, id: Option<ItemId>| -> String {
         id.and_then(|id| board.get_item(id))
             .map(|item| {
@@ -327,7 +342,7 @@ const SIMPLIFY_MM: f64 = 0.01;
 const OPT_CHANGED_AREA_MS: i32 = 1000;
 
 /// The items in violations beyond `allowed`, counted per kind and net pair, in the checker's order.
-fn new_violation_items(board: &mut Board, allowed: &BTreeMap<ViolationKey, usize>) -> Vec<ItemId> {
+pub(super) fn new_violation_items(board: &mut Board, allowed: &BTreeMap<ViolationKey, usize>) -> Vec<ItemId> {
     let mut seen: BTreeMap<ViolationKey, usize> = BTreeMap::new();
     let mut items = Vec::new();
     for (key, first, second) in violation_keys(board) {

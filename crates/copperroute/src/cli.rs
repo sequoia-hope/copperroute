@@ -51,6 +51,9 @@ pub enum Command {
     /// Change the board's shape step by step along a plan (tools/morph_outline.py), carrying
     /// parts and copper with it, and write the session of the last step.
     Reshape(ReshapeArgs),
+    /// Pull every trace of a routed board taut like a rubber band, the clearances pushing back,
+    /// then let the vias go too, and write the session.
+    Band(BandArgs),
     /// Serve the routing tools over JSON-RPC on stdin/stdout.
     Mcp,
 }
@@ -477,6 +480,10 @@ pub struct ReshapeArgs {
     /// closer than the clearance; 0 never relaxes.
     #[arg(long, default_value_t = 0)]
     pub relax: usize,
+    /// Make every trace a rubber band during relaxation: each round each segment pulls its ends
+    /// together by this fraction of its length before the clearances push back. 0 is no pull.
+    #[arg(long, default_value_t = 0.0)]
+    pub tension: f64,
     /// The router backend for the repair reroute.
     #[arg(long, default_value = "grid")]
     pub repair_backend: String,
@@ -484,6 +491,43 @@ pub struct ReshapeArgs {
     #[arg(long, value_name = "KEY=VALUE")]
     pub set: Vec<String>,
     /// Write an SVG of the board after every step, with frames.jsonl, into this empty directory.
+    #[arg(long)]
+    pub frames: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct BandArgs {
+    /// A Specctra DSN, a KiCad board JSON, or a KiCad .kicad_pcb board.
+    pub input: PathBuf,
+    /// The routed session to pull taut.
+    #[arg(long)]
+    pub ses: PathBuf,
+    /// Where to write the session.
+    #[arg(short, long)]
+    pub output: PathBuf,
+    /// A KiCad .kicad_pro whose design rules are applied.
+    #[arg(long)]
+    pub kicad_project: Option<PathBuf>,
+    /// Rounds with the vias held.
+    #[arg(long, default_value_t = 400)]
+    pub rounds: usize,
+    /// Rounds after that with the vias free.
+    #[arg(long, default_value_t = 0)]
+    pub via_rounds: usize,
+    /// Each round, each segment pulls its ends together by this fraction of its length.
+    #[arg(long, default_value_t = 0.2)]
+    pub tension: f64,
+    /// Traces are split into segments no longer than this, in millimetres, so they can bend.
+    #[arg(long, default_value_t = 0.25)]
+    pub segment_mm: f64,
+    /// Write a frame every this many rounds.
+    #[arg(long, default_value_t = 20)]
+    pub frame_every: usize,
+    /// Router settings, as `--set router.fanout.enabled=false`. Repeatable.
+    #[arg(long, value_name = "KEY=VALUE")]
+    pub set: Vec<String>,
+    /// Write an SVG of the board every `--frame-every` rounds, with frames.jsonl, into this empty
+    /// directory.
     #[arg(long)]
     pub frames: Option<PathBuf>,
 }

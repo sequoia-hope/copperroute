@@ -55,6 +55,10 @@ pub fn run(raw: &[String]) -> ExitCode {
             Ok(_) => commands::blame::run(&cli, args),
             Err(code) => code,
         },
+        cli::Command::Band(args) => match commands::govern(&cli) {
+            Ok(_) => commands::band::run(&cli, args),
+            Err(code) => code,
+        },
         cli::Command::Reshape(args) => match commands::govern(&cli) {
             Ok(_) => commands::reshape::run(&cli, args),
             Err(code) => code,
