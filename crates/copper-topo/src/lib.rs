@@ -5,7 +5,9 @@
 //! changing layers where a via fits; its copper is the shortest path through that channel that
 //! keeps the clearances (the funnel algorithm, each bend pushed out round the corner it wraps),
 //! which is a rubber band pulled taut. Committed copper joins the triangulations, so later wires
-//! go round it.
+//! go round it. A connection that finds no way may then cross other connections' copper at a
+//! price that rises each time a connection is ripped; what it crosses is ripped and rerouted, and
+//! the board that joins most connections is kept.
 
 mod funnel;
 mod world;
@@ -21,7 +23,7 @@ use copper_geometry::{FloatPoint, IntPoint, Point, Polyline};
 use copper_gpu::grid::GridProfile;
 
 use funnel::{Bend, Gate};
-use world::{Face, World};
+use world::{Conns, Face, World};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TopoOptions {
@@ -34,6 +36,11 @@ pub struct TopoOptions {
     pub max_expansions: usize,
     /// Orders to try the connections in; the board keeps the one that routes most.
     pub orders: usize,
+    /// What crossing another connection's copper costs, as a length in board units, before that
+    /// connection's history of being ripped multiplies it.
+    pub rip_cost: f64,
+    /// Rounds of rip-up over the connections still open; 0 turns rip-up off.
+    pub rip_passes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -44,6 +51,8 @@ pub struct TopoStats {
     pub no_channel: usize,
     /// A channel was found but its copper broke a clearance or didn't join the two items.
     pub rejected: usize,
+    /// Rip-ups kept: a connection routed through others' copper, theirs rerouted.
+    pub rip_ups: usize,
     pub vias: usize,
 }
 
@@ -70,11 +79,12 @@ pub fn route_topological(board: &mut Board, options: &TopoOptions, stop: &dyn Fn
         let mut trial = board.clone();
         let stats = route_in_order(&mut trial, &constraints, &reorder(&gaps, order), options, &out_of_time);
         tracing::info!(
-            "topo order {order}: {} of {} connections routed ({} without a channel, {} rejected), {} vias, {:.1} s",
+            "topo order {order}: {} of {} connections routed ({} without a channel, {} rejected before rip-up; {} rip-ups), {} vias, {:.1} s",
             stats.routed,
             stats.connections,
             stats.no_channel,
             stats.rejected,
+            stats.rip_ups,
             stats.vias,
             started.elapsed().as_secs_f64()
         );
@@ -109,6 +119,68 @@ fn reorder(gaps: &[(f64, ItemId, ItemId)], order: usize) -> Vec<(ItemId, ItemId)
     out
 }
 
+/// The copper laid so far: which connection each item belongs to, and each connection's items.
+#[derive(Clone)]
+struct Laid {
+    conns: Conns,
+    items: Vec<Vec<ItemId>>,
+}
+
+impl Laid {
+    fn record(&mut self, world: &mut World, board: &Board, constraints: &DrcConstraints, conn: usize, added: Vec<ItemId>) {
+        for &id in &added {
+            self.conns.insert(id, conn as u32);
+        }
+        world.add_items(board, &added, constraints, &self.conns);
+        self.items[conn].extend(added);
+    }
+
+    fn rip(&mut self, board: &mut Board, conn: usize) {
+        let ids = std::mem::take(&mut self.items[conn]);
+        for id in &ids {
+            self.conns.remove(id);
+        }
+        board.remove_items(ids);
+    }
+}
+
+enum Attempt {
+    Joined,
+    Routed(Vec<ItemId>),
+    NoChannel,
+    /// A channel was found; its copper clashed with these items.
+    Rejected(Vec<ItemId>),
+}
+
+fn net_of(board: &Board, item: ItemId) -> Option<i32> {
+    board.get_item(item).and_then(|i| i.net_nos().first().copied())
+}
+
+fn joined(board: &Board, (from, to): (ItemId, ItemId)) -> bool {
+    net_of(board, from).is_none_or(|net| board.get_item(to).is_none() || board.connected_set(from, net, false).contains(&to))
+}
+
+/// Routes one connection through the world as it is, widening the margin while its copper clashes.
+fn attempt(board: &mut Board, world: &World, constraints: &DrcConstraints, gap: (ItemId, ItemId), options: &TopoOptions) -> Attempt {
+    let (from, to) = gap;
+    if joined(board, gap) {
+        return Attempt::Joined;
+    }
+    let net = net_of(board, from).expect("an open connection has a net");
+    let mut clashes: Option<Vec<ItemId>> = None;
+    for widen in MARGINS {
+        let wire = WireRules::new(board, constraints, net, options.sample * widen);
+        let Some(route) = search(board, world, &wire, from, to, options, None) else {
+            break;
+        };
+        match commit(board, world, &wire, &route, from, to) {
+            Ok((added, _)) => return Attempt::Routed(added),
+            Err(items) => clashes.get_or_insert_with(Vec::new).extend(items),
+        }
+    }
+    clashes.map_or(Attempt::NoChannel, Attempt::Rejected)
+}
+
 fn route_in_order(
     board: &mut Board,
     constraints: &DrcConstraints,
@@ -116,42 +188,121 @@ fn route_in_order(
     options: &TopoOptions,
     out_of_time: &dyn Fn() -> bool,
 ) -> TopoStats {
-    let mut world = World::build(board, options.sample, constraints);
+    let mut laid = Laid { conns: Conns::new(), items: vec![Vec::new(); gaps.len()] };
+    let mut world = World::build(board, options.sample, constraints, &laid.conns);
     let mut stats = TopoStats { connections: gaps.len(), ..TopoStats::default() };
-    for &(from, to) in gaps {
+    for (conn, &gap) in gaps.iter().enumerate() {
         if out_of_time() {
             break;
         }
-        let Some(net) = board.get_item(from).and_then(|i| i.net_nos().first().copied()) else {
-            continue;
-        };
-        if board.get_item(to).is_none() || board.connected_set(from, net, false).contains(&to) {
-            continue;
-        }
-        let mut found = false;
-        let mut committed = None;
-        for widen in MARGINS {
-            let wire = WireRules::new(board, constraints, net, options.sample * widen);
-            let Some(route) = search(board, &world, &wire, from, to, options) else {
-                break;
-            };
-            found = true;
-            committed = commit(board, &world, &wire, &route, from, to);
-            if committed.is_some() {
-                break;
-            }
-        }
-        match committed {
-            Some((added, vias)) => {
-                stats.routed += 1;
-                stats.vias += vias;
-                world.add_items(board, &added, constraints);
-            }
-            None if found => stats.rejected += 1,
-            None => stats.no_channel += 1,
+        match attempt(board, &world, constraints, gap, options) {
+            Attempt::Routed(added) => laid.record(&mut world, board, constraints, conn, added),
+            Attempt::Joined => {}
+            Attempt::NoChannel => stats.no_channel += 1,
+            Attempt::Rejected(_) => stats.rejected += 1,
         }
     }
+    stats.rip_ups = rip_up(board, &mut world, &mut laid, constraints, gaps, options, out_of_time);
+    stats.routed = gaps.iter().filter(|&&gap| joined(board, gap)).count();
+    stats.vias = laid.conns.keys().filter(|&&id| matches!(board.get_item(id), Some(Item::Via(_)))).count();
     stats
+}
+
+/// Rounds over the open connections, each routed through other connections' copper where that is
+/// cheapest, the copper it crosses ripped and its connections rerouted. A round's result stands
+/// when it joins no fewer connections, so a connection can trade places with the one it ripped;
+/// the board that joined most is the one left. Returns the rip-ups in that board.
+fn rip_up(
+    board: &mut Board,
+    world: &mut World,
+    laid: &mut Laid,
+    constraints: &DrcConstraints,
+    gaps: &[(ItemId, ItemId)],
+    options: &TopoOptions,
+    out_of_time: &dyn Fn() -> bool,
+) -> usize {
+    let count = |board: &Board| gaps.iter().filter(|&&gap| joined(board, gap)).count();
+    let mut history = vec![0.0; gaps.len()];
+    let mut kept = 0;
+    let mut best: Option<(usize, usize, Board, Laid)> = None;
+    for _ in 0..options.rip_passes {
+        let open: Vec<usize> = (0..gaps.len()).filter(|&c| !joined(board, gaps[c])).collect();
+        let mut moved = false;
+        for conn in open {
+            if out_of_time() {
+                break;
+            }
+            let (from, to) = gaps[conn];
+            if joined(board, gaps[conn]) {
+                continue;
+            }
+            let before = count(board);
+            let net = net_of(board, from).expect("an open connection has a net");
+            let wire = WireRules::new(board, constraints, net, options.sample * MARGINS[0]);
+            let rip = Rip { cost: options.rip_cost, history: &history };
+            let route = search(board, world, &wire, from, to, options, Some(&rip));
+            let mut victims: BTreeSet<u32> = route.as_ref().map(|r| r.victims.clone()).unwrap_or_default();
+            if victims.is_empty() {
+                // The cheapest way crosses nobody's copper yet clashes when laid: rip what it
+                // clashes with.
+                if let Attempt::Rejected(items) = attempt(board, world, constraints, gaps[conn], options) {
+                    tracing::debug!(
+                        "topo rip-up: connection {conn} clashes with {:?}",
+                        items.iter().filter_map(|id| board.get_item(*id).map(|i| (i.kind(), i.net_nos().to_vec(), i.get_fixed_state(), laid.conns.get(id)))).collect::<Vec<_>>()
+                    );
+                    victims.extend(items.iter().filter_map(|id| laid.conns.get(id)));
+                }
+            }
+            if victims.is_empty() {
+                continue;
+            }
+            let saved = (board.clone(), world.clone(), laid.clone());
+            for &victim in &victims {
+                laid.rip(board, victim as usize);
+                history[victim as usize] += 1.0;
+            }
+            *world = World::build(board, options.sample, constraints, &laid.conns);
+            let mut routed = route.and_then(|r| commit(board, world, &wire, &r, from, to).ok()).map(|(added, _)| added);
+            if routed.is_none()
+                && let Attempt::Routed(added) = attempt(board, world, constraints, gaps[conn], options)
+            {
+                routed = Some(added);
+            }
+            if let Some(added) = routed {
+                laid.record(world, board, constraints, conn, added);
+                for &victim in &victims {
+                    if let Attempt::Routed(added) = attempt(board, world, constraints, gaps[victim as usize], options) {
+                        laid.record(world, board, constraints, victim as usize, added);
+                    }
+                }
+            }
+            let after = count(board);
+            tracing::debug!(
+                "topo rip-up: connection {conn} through {victims:?}: {}, {before} -> {after} joined",
+                if laid.items[conn].is_empty() { "not routed" } else { "routed" }
+            );
+            if !laid.items[conn].is_empty() && after >= before {
+                moved = true;
+                kept += 1;
+                if best.as_ref().is_none_or(|b| after > b.0) {
+                    best = Some((after, kept, board.clone(), laid.clone()));
+                }
+            } else {
+                (*board, *world, *laid) = saved;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    match best {
+        Some((joined_then, kept_then, b, l)) if joined_then > count(board) => {
+            *board = b;
+            *laid = l;
+            kept_then
+        }
+        _ => kept,
+    }
 }
 
 /// What one net's wire needs: its width, clearances and via.
@@ -214,8 +365,20 @@ struct State {
 #[derive(Clone)]
 enum Step {
     Start(FloatPoint),
-    Cross(Gate),
-    Via(FloatPoint),
+    Cross(Gate, Vec<u32>),
+    Via(FloatPoint, Vec<u32>),
+}
+
+/// What crossing other connections' copper costs a search that may.
+struct Rip<'a> {
+    cost: f64,
+    history: &'a [f64],
+}
+
+impl Rip<'_> {
+    fn price(&self, victims: &[u32]) -> f64 {
+        victims.iter().map(|&c| self.cost * (1.0 + self.history[c as usize])).sum()
+    }
 }
 
 struct Open {
@@ -252,13 +415,23 @@ struct Run {
 
 struct Route {
     runs: Vec<Run>,
+    /// The connections whose copper it crosses.
+    victims: BTreeSet<u32>,
 }
 
 const HEURISTIC_WEIGHT: f64 = 1.2;
 /// The margins a connection is tried with, in samples, widening each time its copper clashes.
 const MARGINS: [f64; 3] = [0.5, 1.5, 3.0];
 
-fn search(board: &Board, world: &World, wire: &WireRules<'_>, from: ItemId, to: ItemId, options: &TopoOptions) -> Option<Route> {
+fn search(
+    board: &Board,
+    world: &World,
+    wire: &WireRules<'_>,
+    from: ItemId,
+    to: ItemId,
+    options: &TopoOptions,
+    rip: Option<&Rip<'_>>,
+) -> Option<Route> {
     let ends = |item: ItemId| -> Vec<(State, FloatPoint)> {
         let net = wire.net;
         let mut out = Vec::new();
@@ -298,7 +471,8 @@ fn search(board: &Board, world: &World, wire: &WireRules<'_>, from: ItemId, to: 
         parent.insert(*state, (None, Step::Start(*at)));
         open.push(Open { f: h(at), g: 0.0, state: *state, at: *at });
     }
-    let mut via_ok: HashMap<State, Option<FloatPoint>> = HashMap::new();
+    let price = |victims: &[u32]| rip.map_or(0.0, |r| r.price(victims));
+    let mut via_ok: HashMap<State, Option<(FloatPoint, Vec<u32>)>> = HashMap::new();
     let mut expanded = 0;
     while let Some(Open { g, state, at, .. }) = open.pop() {
         if best.get(&state).is_some_and(|b| *b < g) {
@@ -318,20 +492,24 @@ fn search(board: &Board, world: &World, wire: &WireRules<'_>, from: ItemId, to: 
                 open.push(Open { f: g2 + h(&at2), g: g2, state: next, at: at2 });
             }
         };
-        for (face, gate) in world.gates(board, wire, state.layer, state.face) {
+        for (face, gate, victims) in world.gates(board, wire, state.layer, state.face, rip.is_some()) {
             let p = gate.nearest(&at);
             let next = State { layer: state.layer, face };
-            push(next, g + (p.x - at.x).hypot(p.y - at.y), p, Step::Cross(gate));
+            let g2 = g + (p.x - at.x).hypot(p.y - at.y) + price(&victims);
+            push(next, g2, p, Step::Cross(gate, victims));
         }
-        let via = *via_ok.entry(state).or_insert_with(|| world.via_site(board, wire, state.layer, state.face));
-        if let Some(site) = via {
+        let via = via_ok
+            .entry(state)
+            .or_insert_with(|| world.via_site(board, wire, state.layer, state.face, rip.is_some()))
+            .clone();
+        if let Some((site, victims)) = via {
             for &layer in &wire.profile.layers {
                 if layer == state.layer {
                     continue;
                 }
                 if let Some(face) = world.face_at(layer, &site) {
-                    let g2 = g + (site.x - at.x).hypot(site.y - at.y) + options.via_cost;
-                    push(State { layer, face }, g2, site, Step::Via(site));
+                    let g2 = g + (site.x - at.x).hypot(site.y - at.y) + options.via_cost + price(&victims);
+                    push(State { layer, face }, g2, site, Step::Via(site, victims.clone()));
                 }
             }
         }
@@ -349,23 +527,36 @@ fn unwind(parent: &HashMap<State, (Option<State>, Step)>, last: State, end: Floa
     }
     steps.reverse();
     let mut runs: Vec<Run> = Vec::new();
+    let mut victims = BTreeSet::new();
     for (layer, step) in steps {
         match step {
             Step::Start(p) => runs.push(Run { layer, from: p, gates: Vec::new(), to: p }),
-            Step::Cross(gate) => runs.last_mut().expect("a route starts").gates.push(gate),
-            Step::Via(site) => {
+            Step::Cross(gate, crossed) => {
+                runs.last_mut().expect("a route starts").gates.push(gate);
+                victims.extend(crossed);
+            }
+            Step::Via(site, crossed) => {
                 runs.last_mut().expect("a route starts").to = site;
                 runs.push(Run { layer, from: site, gates: Vec::new(), to: site });
+                victims.extend(crossed);
             }
         }
     }
     runs.last_mut().expect("a route starts").to = end;
-    Route { runs }
+    Route { runs, victims }
 }
 
-/// Inserts the route's traces and vias; returns the items added and the vias among them, or
-/// `None`, leaving the board as it was, when its copper breaks a clearance or doesn't join.
-fn commit(board: &mut Board, world: &World, wire: &WireRules<'_>, route: &Route, from: ItemId, to: ItemId) -> Option<(Vec<ItemId>, usize)> {
+/// Inserts the route's traces and vias; returns the items added and the vias among them, or,
+/// leaving the board as it was, the items its copper clashes with (none when a via clashes or the
+/// copper doesn't join).
+fn commit(
+    board: &mut Board,
+    world: &World,
+    wire: &WireRules<'_>,
+    route: &Route,
+    from: ItemId,
+    to: ItemId,
+) -> Result<(Vec<ItemId>, usize), Vec<ItemId>> {
     let existing: BTreeSet<ItemId> = board.get_items().map(Item::id).collect();
     let round = |p: &FloatPoint| Point::Int(IntPoint::new(p.x.round() as i32, p.y.round() as i32));
     let mut vias = 0;
@@ -404,9 +595,16 @@ fn commit(board: &mut Board, world: &World, wire: &WireRules<'_>, route: &Route,
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     explain_clash(board, wire, run.layer, &pair[0].to_float(), &pair[1].to_float());
                 }
+                let clashes = Polyline::from_points(pair).offset_shape(wire.profile.half_width, 0).map_or(Vec::new(), |shape| {
+                    board
+                        .overlapping_items_with_clearance(&shape, Some(run.layer), &[wire.net], wire.profile.trace_clearance_class)
+                        .into_iter()
+                        .filter(|id| existing.contains(id) && board.get_item(*id).is_some_and(|i| i.is_trace_obstacle(wire.net)))
+                        .collect()
+                });
                 let added: Vec<ItemId> = board.get_items().map(Item::id).filter(|id| !existing.contains(id)).collect();
                 board.remove_items(added);
-                return None;
+                return Err(clashes);
             };
             widths.push(width);
         }
@@ -427,14 +625,16 @@ fn commit(board: &mut Board, world: &World, wire: &WireRules<'_>, route: &Route,
             start = end;
         }
         if k + 1 < route.runs.len() {
-            let via = wire.profile.via.as_ref()?;
+            let Some(via) = wire.profile.via.as_ref() else {
+                return Err(Vec::new());
+            };
             match board.insert_via(via.padstack, round(&run.to), vec![wire.net], via.clearance_class, FixedState::Unfixed, false) {
                 Ok(id) if keeps_clearance(board, id) => vias += 1,
                 _ => {
                     tracing::debug!("topo: net {} rejected: its via clashes", wire.net);
                     let added: Vec<ItemId> = board.get_items().map(Item::id).filter(|id| !existing.contains(id)).collect();
                     board.remove_items(added);
-                    return None;
+                    return Err(Vec::new());
                 }
             }
         }
@@ -443,9 +643,9 @@ fn commit(board: &mut Board, world: &World, wire: &WireRules<'_>, route: &Route,
     if !board.connected_set(from, wire.net, false).contains(&to) {
         tracing::debug!("topo: net {} rejected: its copper doesn't join", wire.net);
         board.remove_items(added);
-        return None;
+        return Err(Vec::new());
     }
-    Some((added, vias))
+    Ok((added, vias))
 }
 
 fn keeps_clearance(board: &mut Board, id: ItemId) -> bool {

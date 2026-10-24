@@ -3,6 +3,7 @@
 pub mod backend;
 pub mod cancel;
 pub mod ctx;
+pub mod diffuse_backend;
 pub mod file_details;
 pub mod job;
 pub mod load;

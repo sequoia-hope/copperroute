@@ -194,7 +194,17 @@ pub fn run(cli: &Cli, args: &ReshapeArgs) -> ExitCode {
         };
         let ripped = if due {
             if args.reroute {
-                reroute(board, &loaded.settings, args.repair_ms, backend, args.rip_design_wiring)
+                let spread = (args.diffuse_target > 0.0).then(|| Spread {
+                    options: copper_morph::DiffuseOptions {
+                        target_density: args.diffuse_target,
+                        max_move_mm: args.diffuse_max_mm,
+                        ..copper_morph::DiffuseOptions::default()
+                    },
+                    locked: &locked,
+                    bodies: &bodies,
+                    names: &names,
+                });
+                reroute(board, &loaded.settings, args.repair_ms, backend, args.rip_design_wiring, spread.as_ref())
             } else {
                 repair(board, &allowed, &protected, &loaded.settings, args.repair_ms, backend)
             }
@@ -456,6 +466,27 @@ const SIMPLIFY_MM: f64 = 0.01;
 const STOP_REPORT: usize = 15;
 /// Smaller pushes are pads lying snug against copper, not pads pressed into it.
 const NUDGE_MIN_MM: f64 = 0.02;
+const DIFFUSE_AIRLINE_WIDTH_MM: f64 = 0.4;
+const DIFFUSE_AIRLINE_SAMPLE_MM: f64 = 0.5;
+const DIFFUSE_SWEEPS: usize = 3;
+
+fn diffuse(board: &mut Board, spread: &Spread<'_>) {
+    let demand = copper_morph::airline_demand(board, DIFFUSE_AIRLINE_WIDTH_MM, DIFFUSE_AIRLINE_SAMPLE_MM);
+    let report = copper_morph::diffusion_moves(board, &spread.options, spread.bodies, spread.locked, &demand);
+    let per_mm = board.communication.get_resolution(copper_board::structure::Unit::Mm);
+    let oracle = copper_morph::MoveOracle { guard: 0.0, routable_copper_is_soft: true, fixed_copper_bends: false };
+    let made = copper_morph::apply_moves(board, &oracle, &report.moves, spread.bodies, DIFFUSE_SWEEPS);
+    let farthest = made.values().map(|v| f64::from(v.x).hypot(f64::from(v.y)) / per_mm).fold(0.0, f64::max);
+    tracing::info!(
+        "diffuse: peak density {:.2} -> {:.2} in {} rounds; {} of {} parts moved, farthest {farthest:.2} mm: {:?}",
+        report.peak_before,
+        report.peak_after,
+        report.rounds,
+        made.len(),
+        report.moves.len(),
+        made.keys().filter_map(|id| spread.names.get(id)).collect::<Vec<_>>()
+    );
+}
 const OPT_CHANGED_AREA_MS: i32 = 1000;
 
 /// The violations beyond `allowed`, counted per kind and net pair, in the checker's order.
@@ -570,12 +601,20 @@ fn repair(
 
 /// Rips every trace and via the design didn't fix (all of them with `design_too`) and routes the
 /// board again, with the optimizer. Returns how many items were ripped.
+struct Spread<'a> {
+    options: copper_morph::DiffuseOptions,
+    locked: &'a BTreeSet<i32>,
+    bodies: &'a [Vec<i32>],
+    names: &'a BTreeMap<i32, String>,
+}
+
 fn reroute(
     board: &mut Board,
     settings: &copper_settings::RouterSettings,
     deadline_ms: i32,
     backend: &'static dyn copper_core::RouterBackend,
     design_too: bool,
+    spread: Option<&Spread<'_>>,
 ) -> usize {
     let doomed: Vec<ItemId> = board
         .get_items()
@@ -590,6 +629,9 @@ fn reroute(
             item.set_fixed_state(copper_board::structure::FixedState::Unfixed);
         }
         board.remove_item(id);
+    }
+    if let Some(spread) = spread {
+        diffuse(board, spread);
     }
     let mut settings = settings.clone();
     if settings.opt_changed_area_ms.unwrap_or(0) <= 0 {

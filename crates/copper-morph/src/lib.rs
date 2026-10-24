@@ -5,6 +5,7 @@
 //! conflict that was not already there before the move. Pairs that start in conflict are
 //! grandfathered, so a board that is not DRC-clean can still be nudged without being made worse.
 
+mod diffuse;
 mod dipole;
 pub mod frames;
 mod oracle;
@@ -14,6 +15,7 @@ mod settle;
 mod shove;
 mod warp;
 
+pub use diffuse::{DiffuseOptions, DiffuseReport, airline_demand, apply_moves, diffusion_moves};
 pub use dipole::{Dipole, dipole_targets};
 pub use relax::{NetPair, RelaxReport, relax_clearance, simplify_traces, subdivide_traces};
 pub use reshape::{PartMove, ReshapeReport, nudge_parts, reshape_step};

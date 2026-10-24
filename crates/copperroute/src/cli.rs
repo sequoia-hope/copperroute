@@ -481,6 +481,14 @@ pub struct ReshapeArgs {
     /// pads alone.
     #[arg(long)]
     pub rip_design_wiring: bool,
+    /// With `--reroute`, spread crowded parts by diffusion once the routing is ripped, until no
+    /// bin of the board is fuller than this density (part and routing demand over area). 0 never
+    /// spreads.
+    #[arg(long, default_value_t = 0.0)]
+    pub diffuse_target: f64,
+    /// The furthest diffusion moves one part at one keyframe, in millimetres.
+    #[arg(long, default_value_t = 2.0)]
+    pub diffuse_max_mm: f64,
     /// The reroute's time limit, in milliseconds.
     #[arg(long, default_value_t = 60_000)]
     pub repair_ms: i32,

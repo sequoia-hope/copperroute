@@ -400,29 +400,43 @@ fn base_route(
     budget: RouterBudget,
     progress: &mut dyn ProgressSink,
 ) -> Result<PipelineResult, RouterError> {
+    let grid = std::env::var("COPPERROUTE_NUDGE_BASE").is_ok_and(|v| v == "grid");
+    route_on(grid, board, settings, stop, budget, progress)
+}
+
+pub(crate) fn route_on(
+    grid: bool,
+    board: &mut Board,
+    settings: &RouterSettings,
+    stop: &RouterStop,
+    budget: RouterBudget,
+    progress: &mut dyn ProgressSink,
+) -> Result<PipelineResult, RouterError> {
     #[cfg(feature = "gpu")]
-    if std::env::var("COPPERROUTE_NUDGE_BASE").is_ok_and(|v| v == "grid") {
+    if grid {
         return crate::grid_backend::GridBackend.route(board, settings, stop, budget, progress);
     }
+    #[cfg(not(feature = "gpu"))]
+    let _ = grid;
     run_pipeline(board, settings, stop, budget, progress)
 }
 
 /// A full stop only: the router legitimately leaves its own stop in the autorouter-only state
 /// when it finishes, so that state cannot mean "stop nudging".
-fn halted(stop: &RouterStop) -> bool {
+pub(crate) fn halted(stop: &RouterStop) -> bool {
     stop.poll_cancel();
     stop.poll_deadline();
     stop.is_stop_requested()
 }
 
-fn violation_count(board: &mut Board) -> usize {
+pub(crate) fn violation_count(board: &mut Board) -> usize {
     copper_drc::DesignRulesChecker::new(board)
         .get_all_violations()
         .len()
 }
 
 /// Gaps between two items only: a lone dangling item is listed too, but no move connects it.
-fn unconnected_count(board: &mut Board) -> usize {
+pub(crate) fn unconnected_count(board: &mut Board) -> usize {
     copper_drc::DesignRulesChecker::new(board)
         .get_all_unconnected_items()
         .iter()

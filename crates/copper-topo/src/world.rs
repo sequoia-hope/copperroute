@@ -1,5 +1,6 @@
 //! The obstacles, per layer: their outlines as triangulation samples, and an index of their
-//! polygons for the exact questions the samples can't answer.
+//! polygons for the exact questions the samples can't answer. Copper this router laid remembers
+//! the connection it belongs to, so a search may cross it at a price and have it ripped.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -17,8 +18,11 @@ use spade::{DelaunayTriangulation, Point2, PositionInTriangulation, Triangulatio
 use crate::WireRules;
 use crate::funnel::Gate;
 
+#[derive(Clone)]
 struct Obstacle {
     nets: Vec<i32>,
+    /// The connection this copper was laid for, when a rip-up may remove it.
+    conn: Option<u32>,
     class: usize,
     /// The DRC clearance rule of its net's class.
     rule: i32,
@@ -28,19 +32,21 @@ struct Obstacle {
     polygon: Vec<FloatPoint>,
 }
 
+#[derive(Clone)]
 struct Layer {
     cdt: DelaunayTriangulation<Point2<f64>>,
     /// The obstacles each vertex samples, by vertex index.
     owners: Vec<Vec<u32>>,
 }
 
+#[derive(Clone)]
 pub struct World {
     obstacles: Vec<Obstacle>,
     layers: BTreeMap<usize, Layer>,
     cells: HashMap<(usize, i64, i64), Vec<u32>>,
     cell: f64,
     sample: f64,
-    holes: Vec<(FloatPoint, f64)>,
+    holes: Vec<(FloatPoint, f64, Option<u32>)>,
     hole_to_hole: f64,
     copper_layers: usize,
 }
@@ -50,8 +56,18 @@ const CELL_MM: f64 = 1.0;
 const MAX_BENDS: usize = 200;
 const BEND_SLACK: f64 = 1.02;
 
+/// How near a wire's centre may come to a vertex: with everything kept, and with the copper of
+/// `soft`, the connections that keep it nearer, ripped.
+struct Reach {
+    hard: f64,
+    all: f64,
+    soft: Vec<u32>,
+}
+
+pub type Conns = HashMap<ItemId, u32>;
+
 impl World {
-    pub fn build(board: &Board, sample: f64, constraints: &DrcConstraints) -> World {
+    pub fn build(board: &Board, sample: f64, constraints: &DrcConstraints, conns: &Conns) -> World {
         let bounds = board.get_bounding_box();
         let pad = 10.0 * sample;
         let frame = [
@@ -79,18 +95,19 @@ impl World {
             copper_layers: board.get_layer_count(),
         };
         let ids: Vec<ItemId> = board.get_items().map(Item::id).collect();
-        world.add_items(board, &ids, constraints);
+        world.add_items(board, &ids, constraints, conns);
         world
     }
 
-    pub fn add_items(&mut self, board: &Board, ids: &[ItemId], constraints: &DrcConstraints) {
+    pub fn add_items(&mut self, board: &Board, ids: &[ItemId], constraints: &DrcConstraints, conns: &Conns) {
         let ctx = board.ctx();
         for &id in ids {
             let Some(item) = board.get_item(id) else {
                 continue;
             };
+            let conn = conns.get(&id).copied();
             if let Some(hole) = copper_drc::checks::geometry::hole_of(board, id) {
-                self.holes.push((hole.center, hole.radius));
+                self.holes.push((hole.center, hole.radius, conn));
             }
             let traces = item.is_trace_obstacle(i32::MIN);
             let vias = traces || matches!(item, Item::ViaObstacleArea(_));
@@ -124,14 +141,14 @@ impl World {
                         l.insert(p, Some(at));
                     }
                 }
-                self.obstacles.push(Obstacle { nets: nets.clone(), class: item.clearance_class(), rule, traces, vias, layer, polygon });
+                self.obstacles.push(Obstacle { nets: nets.clone(), conn, class: item.clearance_class(), rule, traces, vias, layer, polygon });
             }
         }
     }
 
     pub fn face_at(&self, layer: usize, p: &FloatPoint) -> Option<Face> {
         let cdt = &self.layers.get(&layer)?.cdt;
-        let face = match cdt.locate(Point2::new(p.x, p.y)) {
+        match cdt.locate(Point2::new(p.x, p.y)) {
             PositionInTriangulation::OnFace(face) => Some(face),
             PositionInTriangulation::OnEdge(edge) => {
                 let edge = cdt.directed_edge(edge);
@@ -141,19 +158,26 @@ impl World {
                 cdt.vertex(vertex).out_edges().find_map(|e| e.face().as_inner()).map(|f| f.fix())
             }
             _ => None,
-        };
-        face
+        }
     }
 
-    /// How near a wire's centre may come to a vertex: the reach of the nearest-kept obstacle it
-    /// samples that blocks the wire's net, 0 when none does.
-    fn reach(&self, board: &Board, wire: &WireRules<'_>, layer: usize, owners: &[u32]) -> f64 {
-        owners
-            .iter()
-            .map(|&o| &self.obstacles[o as usize])
-            .filter(|o| o.traces && !o.nets.contains(&wire.net))
-            .map(|o| wire.reach(board, o.class, o.rule, layer))
-            .fold(0.0, f64::max)
+    /// The reach of the obstacles a vertex samples that block the wire's net, 0 when none does.
+    fn reach(&self, board: &Board, wire: &WireRules<'_>, layer: usize, owners: &[u32]) -> Reach {
+        let mut out = Reach { hard: 0.0, all: 0.0, soft: Vec::new() };
+        let mut soft = Vec::new();
+        for o in owners.iter().map(|&o| &self.obstacles[o as usize]) {
+            if !o.traces || o.nets.contains(&wire.net) {
+                continue;
+            }
+            let reach = wire.reach(board, o.class, o.rule, layer);
+            out.all = out.all.max(reach);
+            match o.conn {
+                Some(c) => soft.push((c, reach)),
+                None => out.hard = out.hard.max(reach),
+            }
+        }
+        out.soft = soft.into_iter().filter(|&(_, r)| r > out.hard).map(|(c, _)| c).collect();
+        out
     }
 
     fn near(&self, layer: usize, p: &FloatPoint, radius: f64) -> impl Iterator<Item = &Obstacle> {
@@ -173,8 +197,10 @@ impl World {
     }
 
     /// The faces a wire may step to from `face`, each with the stretch of the shared edge it may
-    /// cross: the edge less each end's reach, if what is left is free copper.
-    pub fn gates(&self, board: &Board, wire: &WireRules<'_>, layer: usize, face: Face) -> Vec<(Face, Gate)> {
+    /// cross: the edge less each end's reach, if what is left is free copper. With `rip`, an edge
+    /// also gives the wider stretch it would have with other connections' copper ripped, and the
+    /// connections that would be.
+    pub fn gates(&self, board: &Board, wire: &WireRules<'_>, layer: usize, face: Face, rip: bool) -> Vec<(Face, Gate, Vec<u32>)> {
         let Some(l) = self.layers.get(&layer) else {
             return Vec::new();
         };
@@ -186,28 +212,44 @@ impl World {
             };
             let (u, v) = (edge.from(), edge.to());
             let (pu, pv) = (u.position(), v.position());
-            let ru = self.reach(board, wire, layer, l.owners_of(u.fix().index()));
-            let rv = self.reach(board, wire, layer, l.owners_of(v.fix().index()));
+            let reach_u = self.reach(board, wire, layer, l.owners_of(u.fix().index()));
+            let reach_v = self.reach(board, wire, layer, l.owners_of(v.fix().index()));
             let len = (pv.x - pu.x).hypot(pv.y - pu.y);
-            if len <= ru + rv {
-                continue;
+            let mut kinds = vec![(reach_u.all, reach_v.all, false)];
+            if rip {
+                kinds.push((reach_u.hard, reach_v.hard, true));
             }
-            let (dx, dy) = ((pv.x - pu.x) / len, (pv.y - pu.y) / len);
-            let right = FloatPoint::new(pu.x + dx * ru, pu.y + dy * ru);
-            let left = FloatPoint::new(pv.x - dx * rv, pv.y - dy * rv);
-            let mid = FloatPoint::new((left.x + right.x) / 2.0, (left.y + right.y) / 2.0);
-            if self.blocked(wire, layer, &mid) {
-                continue;
+            for (ru, rv, ripping) in kinds {
+                if len <= ru + rv {
+                    continue;
+                }
+                let (dx, dy) = ((pv.x - pu.x) / len, (pv.y - pu.y) / len);
+                let right = FloatPoint::new(pu.x + dx * ru, pu.y + dy * ru);
+                let left = FloatPoint::new(pv.x - dx * rv, pv.y - dy * rv);
+                let mid = FloatPoint::new((left.x + right.x) / 2.0, (left.y + right.y) / 2.0);
+                let Some(mut victims) = self.blockers(wire, layer, &mid, ripping) else {
+                    continue;
+                };
+                if ripping {
+                    victims.extend(&reach_u.soft);
+                    victims.extend(&reach_v.soft);
+                    victims.sort_unstable();
+                    victims.dedup();
+                    if victims.is_empty() {
+                        continue;
+                    }
+                }
+                out.push((
+                    next.fix(),
+                    Gate {
+                        left,
+                        right,
+                        left_wrap: (rv > 0.0).then(|| (FloatPoint::new(pv.x, pv.y), rv)),
+                        right_wrap: (ru > 0.0).then(|| (FloatPoint::new(pu.x, pu.y), ru)),
+                    },
+                    victims,
+                ));
             }
-            out.push((
-                next.fix(),
-                Gate {
-                    left,
-                    right,
-                    left_wrap: (rv > 0.0).then(|| (FloatPoint::new(pv.x, pv.y), rv)),
-                    right_wrap: (ru > 0.0).then(|| (FloatPoint::new(pu.x, pu.y), ru)),
-                },
-            ));
         }
         out
     }
@@ -253,17 +295,30 @@ impl World {
         points
     }
 
-    fn blocked(&self, wire: &WireRules<'_>, layer: usize, p: &FloatPoint) -> bool {
-        self.near(layer, p, 0.0)
-            .any(|o| o.traces && !o.nets.contains(&wire.net) && o.layer == layer && inside(&o.polygon, p))
+    /// `None` when `p` is inside copper that blocks the wire, else the connections whose copper
+    /// it is inside, which only `rip` lets it be.
+    fn blockers(&self, wire: &WireRules<'_>, layer: usize, p: &FloatPoint, rip: bool) -> Option<Vec<u32>> {
+        let mut victims = Vec::new();
+        for o in self.near(layer, p, 0.0) {
+            if !o.traces || o.nets.contains(&wire.net) || o.layer != layer || !inside(&o.polygon, p) {
+                continue;
+            }
+            match o.conn {
+                Some(c) if rip => victims.push(c),
+                _ => return None,
+            }
+        }
+        Some(victims)
     }
 
-    /// The centre of `face` when a via of the wire's net fits there on every copper layer.
-    pub fn via_site(&self, board: &Board, wire: &WireRules<'_>, layer: usize, face: Face) -> Option<FloatPoint> {
+    /// The centre of `face` when a via of the wire's net fits there on every copper layer, with
+    /// the connections whose copper must be ripped for it, which only `rip` allows.
+    pub fn via_site(&self, board: &Board, wire: &WireRules<'_>, layer: usize, face: Face, rip: bool) -> Option<(FloatPoint, Vec<u32>)> {
         let via = wire.profile.via.as_ref()?;
         let l = self.layers.get(&layer)?;
         let centre = l.cdt.face(face).center();
         let c = FloatPoint::new(centre.x, centre.y);
+        let mut victims = Vec::new();
         for copper in 0..self.copper_layers {
             for o in self.near(copper, &c, self.cell) {
                 if !o.vias || o.nets.contains(&wire.net) || o.layer != copper {
@@ -271,15 +326,24 @@ impl World {
                 }
                 let need = wire.via_reach(board, o.class, o.rule, copper)?;
                 if distance(&o.polygon, &c) < need {
-                    return None;
+                    match o.conn {
+                        Some(conn) if rip => victims.push(conn),
+                        _ => return None,
+                    }
                 }
             }
         }
-        let holes_clear = self
-            .holes
-            .iter()
-            .all(|(h, r)| (h.x - c.x).hypot(h.y - c.y) - r - via.drill_radius >= self.hole_to_hole);
-        holes_clear.then_some(c)
+        for (h, r, conn) in &self.holes {
+            if (h.x - c.x).hypot(h.y - c.y) - r - via.drill_radius < self.hole_to_hole {
+                match conn {
+                    Some(conn) if rip => victims.push(*conn),
+                    _ => return None,
+                }
+            }
+        }
+        victims.sort_unstable();
+        victims.dedup();
+        Some((c, victims))
     }
 }
 
